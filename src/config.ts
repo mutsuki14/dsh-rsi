@@ -90,7 +90,7 @@ export const Config: Schema<Config> = Schema.object({
       .description('Let the Verifier publish UNVERIFIED to request reproducible evidence instead of guessing.'),
     transportRetries: Schema.natural().default(2)
       .description('Same-context continuations when a role reply lacks its transport token.'),
-    taskMessages: Schema.natural().min(1).default(3)
+    taskMessages: Schema.natural().min(1).max(16).default(3)
       .description('Most recent user messages given verbatim to the interactive Verifier as the authoritative task.'),
     denyTools: Schema.array(Schema.string()).default(['write', 'edit'])
       .description('File-mutating tools hidden from Verifier contexts (names that do not exist are ignored).'),

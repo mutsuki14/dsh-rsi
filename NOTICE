@@ -1,0 +1,20 @@
+dsh-rsi
+Copyright 2026 dsh-rsi contributors
+
+This product adapts the role prompts, transport tokens, memory-commit
+pipeline, and Phase 1 / Phase 2 lineage protocol of RSIAgent
+(https://github.com/AetherLabsAI/RSIAgent), Copyright 2026 RSIAgent
+contributors, licensed under the Apache License, Version 2.0:
+
+  Sibo Zhu, Shicheng Fan, Xinyue Wang, Wenyi Wu, Kun Zhou, Biwei Huang.
+  "RSIAgent: Autonomous Exploration for Recursive Self-improvement in New
+  Environments." arXiv:2609.15364, 2026.
+
+The prompts were rewritten for a tool-using coding harness; the adapted
+sources are src/roles/*.ts, src/protocol/*.ts, src/memory/hash.ts and
+src/engine/lineage.ts. No RSIAgent benchmark, VM, or evaluator code is
+included.
+
+DeepSeek Harness (https://github.com/deepseek-ai/deepseek-harness) is
+MIT-licensed; this package depends on its published npm packages and does
+not redistribute them.

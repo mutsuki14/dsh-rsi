@@ -121,3 +121,22 @@ describe('MemoryStore', () => {
     expect((await readdir(root)).filter(name => name.startsWith('.'))).toEqual([])
   })
 })
+
+describe('workspaceState', () => {
+  it('captures uncommitted changes and leaves the RSI state directory out', async () => {
+    const { execFileSync } = await import('node:child_process')
+    const { workspaceState } = await import('../src/host/git.ts')
+    const repo = await mkdtemp(join(tmpdir(), 'dsh-rsi-git-'))
+    execFileSync('git', ['init', '-q'], { cwd: repo })
+    execFileSync('git', ['-c', 'user.email=t@e', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'init'], { cwd: repo })
+    await writeFile(join(repo, 'app.py'), 'print(1)\n')
+    await mkdir(join(repo, '.dsh-rsi', 'memory'), { recursive: true })
+    await writeFile(join(repo, '.dsh-rsi', 'memory', 'x.md'), 'harness-owned')
+    const state = await workspaceState(repo, ['.dsh-rsi'])
+    expect(state.tracked).toBe(true)
+    expect(state.summary).toContain('?? app.py')
+    expect(state.summary).not.toContain('.dsh-rsi')
+    const untracked = await workspaceState(await mkdtemp(join(tmpdir(), 'dsh-rsi-nogit-')))
+    expect(untracked.tracked).toBe(false)
+  })
+})

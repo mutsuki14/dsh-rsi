@@ -18,6 +18,7 @@ import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-working-directory'
 import { defineTool, type ToolRestriction } from '@deepseek-ai/dsh-tools'
 import { randomUUID } from 'node:crypto'
+import { isAbsolute, relative } from 'node:path'
 import { z } from 'zod'
 import { Config } from './config.ts'
 import { runBroadExploration, runDeepExploration, type EngineConfig } from './engine/lineage.ts'
@@ -48,6 +49,8 @@ export const inject = ['tools', 'systemPrompt', 'subagents', 'sessionProjections
 /** Recent user-authored request texts, folded from the session log. */
 interface RequestsState {
   texts: string[]
+  /** Total user requests folded so far; detects a new task after a PASS. */
+  count: number
 }
 
 declare module '@deepseek-ai/dsh-session-projection/types' {
@@ -79,6 +82,8 @@ const MEMORY_CONTEXT_ORDER = 130
 interface TaskState {
   generation: number
   reports: string[]
+  /** User-request count when the latest verdict was published. */
+  requestCount: number
   verdict?: Verdict
   report?: string
   learning?: { draft: MemoryDraft, stage: 'distill' | 'reconcile', outcome: TerminalOutcome }
@@ -88,7 +93,7 @@ function requestsOf(event: SessionEvent, state: RequestsState): RequestsState {
   if (event.type !== 'user/message' || event.data.source.kind !== 'user') return state
   const text = event.data.content.map(block => (block.type === 'text' ? block.text : '')).join('').trim()
   if (text === '') return state
-  return { texts: [...state.texts, text].slice(-REQUESTS_KEPT) }
+  return { texts: [...state.texts, text].slice(-REQUESTS_KEPT), count: state.count + 1 }
 }
 
 function requireAgent(agent: Agent | undefined, tool: string): Agent {
@@ -110,7 +115,7 @@ export function apply(ctx: Context, config: Config): void {
   const taskOf = (agent: Agent): TaskState => {
     let state = tasks.get(agent.id)
     if (!state) {
-      state = { generation: 0, reports: [] }
+      state = { generation: 0, reports: [], requestCount: 0 }
       tasks.set(agent.id, state)
     }
     return state
@@ -121,10 +126,10 @@ export function apply(ctx: Context, config: Config): void {
   // ---------------------------------------------------------------- prompt
   ctx.sessionProjections.register<'dsh-rsi/requests', RequestsState>({
     key: 'dsh-rsi/requests',
-    stateSchema: z.object({ texts: z.array(z.string()) }),
-    init: () => ({ texts: [] }),
+    stateSchema: z.object({ texts: z.array(z.string()), count: z.number().int().nonnegative() }),
+    init: () => ({ texts: [], count: 0 }),
     apply: (state, event) => requestsOf(event, state),
-    stateVersion: 1,
+    stateVersion: 2,
   })
 
   ctx.systemPrompt.section({
@@ -156,7 +161,10 @@ export function apply(ctx: Context, config: Config): void {
     return undefined
   })
   ctx.on('agent/disposed', ({ agent }) => {
+    const learning = tasks.get(agent.id)?.learning
     tasks.delete(agent.id)
+    // An unpromoted draft never becomes memory; drop its working copy with the session.
+    if (learning) void stores.forAgent(agent).then(store => store.discardDraft(learning.draft.episode)).catch(() => undefined)
   })
 
   // ---------------------------------------------------------------- memory views
@@ -349,11 +357,19 @@ export function apply(ctx: Context, config: Config): void {
     async execute(args, exec) {
       const agent = requireAgent(exec.agent, 'rsi_submit')
       interactiveOnly(agent, 'rsi_submit')
-      const state = taskOf(agent)
+      let state = taskOf(agent)
       if (state.learning) throw new Error('a learning phase is open; finish it with rsi_memory_commit before submitting again')
+      const requests = ctx.sessionProjections.stateOf(agent.session, 'dsh-rsi/requests')?.count ?? 0
+      if (state.verdict === 'PASS' && requests > state.requestCount) {
+        // A new user request after a verified task starts a new task: its Verifier inherits no reports.
+        tasks.delete(agent.id)
+        state = taskOf(agent)
+      }
       const store = await stores.forAgent(agent)
       const cwd = ctx.get('workingDirectory')?.get(agent.session) ?? stores.projectDir(agent)
-      const before = await workspaceState(cwd)
+      const stateRel = relative(cwd, stores.stateRoot(stores.projectDir(agent)))
+      const exclude = stateRel !== '' && !stateRel.startsWith('..') && !isAbsolute(stateRel) ? [stateRel] : []
+      const before = await workspaceState(cwd, exclude)
       const leads = state.verdict === 'UNVERIFIED' ? args.evidence_leads : undefined
       state.generation++
       const runtime = runtimeFor(agent, store, exec.signal, event => logger.debug('%o', event))
@@ -380,13 +396,14 @@ export function apply(ctx: Context, config: Config): void {
         await verifier.close()
       }
       if (result.kind === 'infra') throw new Error(`verification is unavailable: ${result.reason}. This is an infrastructure failure, not a verdict.`)
-      const after = before.tracked ? await workspaceState(cwd) : before
+      const after = before.tracked ? await workspaceState(cwd, exclude) : before
       const tamper = before.tracked && after.digest !== before.digest
         ? '\n\nHARNESS NOTE: the working tree changed during verification; inspect it before continuing.'
         : ''
       state.verdict = result.verdict
       state.report = result.report
       state.reports.push(result.report)
+      state.requestCount = requests
       const learn = config.mode === 'learn' && !(await frozen(store))
       let guidance: string
       switch (result.verdict) {

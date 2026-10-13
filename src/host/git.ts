@@ -23,14 +23,19 @@ export interface WorkspaceState {
   digest: string
 }
 
-/** Harness-captured change facts for an interactive candidate: git status and diff stat, never a grade. */
-export async function workspaceState(cwd: string): Promise<WorkspaceState> {
-  const status = await git(cwd, ['status', '--porcelain=v1', '--untracked-files=all'])
+/**
+ * Harness-captured change facts for an interactive candidate: git status and
+ * diff stat, never a grade. `exclude` paths (the RSI state directory) are
+ * harness-owned and left out of the candidate.
+ */
+export async function workspaceState(cwd: string, exclude: readonly string[] = []): Promise<WorkspaceState> {
+  const pathspec = ['--', '.', ...exclude.map(path => `:(exclude)${path}`)]
+  const status = await git(cwd, ['status', '--porcelain=v1', '--untracked-files=all', ...pathspec])
   if (status === undefined) {
     return { tracked: false, summary: `Candidate root: ${cwd}\nNo git repository: file-change capture is unavailable; inspect the live state directly.`, digest: '' }
   }
-  const stat = (await git(cwd, ['diff', '--stat', 'HEAD'])) ?? ''
-  const diff = (await git(cwd, ['diff', 'HEAD'])) ?? ''
+  const stat = (await git(cwd, ['diff', '--stat', 'HEAD', ...pathspec])) ?? ''
+  const diff = (await git(cwd, ['diff', 'HEAD', ...pathspec])) ?? ''
   const lines = status.split('\n').filter(Boolean)
   const shown = lines.slice(0, 200).map(line => `  ${line}`).join('\n')
   const more = lines.length > 200 ? `\n  … ${lines.length - 200} more` : ''

@@ -34,12 +34,14 @@
   },
   "files": [
     "lib",
-    "skills",
     "locale/*.json",
     "icon.svg",
     "cordis.patch.yml",
     "README.md",
-    "README.zh.md"
+    "README.zh.md",
+    "LICENSE",
+    "NOTICE",
+    "docs"
   ],
   "dsh": {
     "bundle": {
@@ -54,7 +56,8 @@
     "prepare": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "check": "pnpm run typecheck && pnpm run test"
+    "check": "pnpm run typecheck && pnpm run test",
+    "e2e": "bash scripts/e2e-headless.sh"
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.4",

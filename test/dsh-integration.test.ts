@@ -208,6 +208,41 @@ describe('dsh-rsi inside the real harness', () => {
     expect(verifierRequest).not.toContain('Recursive self-improvement protocol')
   })
 
+  it('keeps Verifier continuity across a repair, and starts fresh for a new task after PASS', async () => {
+    const inspections: string[] = []
+    const adapter = new RouterAdapter({
+      main: (_options, call) => {
+        switch (call) {
+          case 0: return toolCall('t0', 'rsi_submit', {})
+          case 1: return toolCall('t1', 'rsi_submit', {})
+          case 2: return textResponse('Task A verified.')
+          case 3: return toolCall('t3', 'rsi_submit', {})
+          default: return textResponse('Task B verified.')
+        }
+      },
+      verifier: (options, call) => {
+        if (call > 0) return textResponse('closing')
+        const prompt = lastMessage(options)
+        inspections.push(prompt)
+        if (inspections.length === 1) return toolCall('v1', 'rsi_handoff', { text: 'README.md is missing the usage section.\nVERDICT: FAIL' })
+        return toolCall(`v${inspections.length}`, 'rsi_handoff', { text: 'All requirements hold.\nVERDICT: PASS' })
+      },
+      actor: () => textResponse('unused'),
+      curriculum: () => textResponse('unused'),
+    })
+    const { ctx, main } = await harness(adapter)
+    await ask(ctx, main, 'Task A: add a usage section to README.md')
+    await ask(ctx, main, 'Task B: add a license badge')
+    expect(adapter.errors).toEqual([])
+
+    expect(toolResults(main).map(result => result.text.split('\n')[0])).toEqual(['VERDICT: FAIL', 'VERDICT: PASS', 'VERDICT: PASS'])
+    expect(inspections[1]).toContain('candidate generation 2')
+    expect(inspections[1]).toContain('README.md is missing the usage section.')
+    expect(inspections[2]).toContain('candidate generation 1')
+    expect(inspections[2]).not.toContain('missing the usage section')
+    expect(inspections[2]).toContain('Task B: add a license badge')
+  })
+
   it('refuses memory writes outside a learning phase', async () => {
     const adapter = new RouterAdapter({
       main: (_options, call) => (call === 0 ? toolCall('w0', 'rsi_memory_write', { path: 'x.md', content: 'sneak' }) : textResponse('ok')),
