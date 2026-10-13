@@ -146,7 +146,8 @@ describe('decideIsolation', () => {
 })
 
 describe('host-side git and the user configuration', () => {
-  it('keeps system-scope settings such as safe.directory', async () => {
+  // Creating a repository owned by another uid needs root.
+  it.skipIf(process.getuid?.() !== 0)('keeps system-scope settings such as safe.directory', async () => {
     git(root, 'init', '-q')
     await writeFile(join(root, 'a.txt'), 'x')
     git(root, 'add', 'a.txt')
