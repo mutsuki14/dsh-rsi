@@ -31,7 +31,7 @@ beforeEach(async () => {
   events = []
 })
 
-const wave = (ids: string[]) => JSON.stringify({ decision: 'WAVE', rationale: 'explore the CLI', projects: ids.map(id => ({ id, instruction: `In {{PROJECT_ROOT}} create ${id}.txt containing ${id}.` })) })
+const wave = (ids: string[]) => JSON.stringify({ decision: 'WAVE', rationale: 'explore the CLI', projects: ids.map(id => ({ id, instruction: `In <PROJECT_ROOT> create ${id}.txt containing ${id}.` })) })
 
 describe('runBroadExploration', () => {
   it('runs a wave from one snapshot, then commits serially in authored order', async () => {
@@ -45,7 +45,7 @@ describe('runBroadExploration', () => {
         const id = options.label.includes('alpha') ? 'alpha' : 'beta'
         if (turn === 0) {
           expect(message).toContain(`create ${id}.txt`)
-          expect(message).not.toContain('{{PROJECT_ROOT}}')
+          expect(message).not.toContain('<PROJECT_ROOT>')
           await writeFile(join(options.cwd, `${id}.txt`), id)
           return 'STATUS: SUBMIT\nwrote the file'
         }
@@ -141,7 +141,7 @@ describe('runDeepExploration', () => {
         if (curriculumTurns.length === 1) {
           expect(message).toContain('ACTOR LEARNING DIAGNOSIS')
           expect(message).toContain('diagnosis: unsure about the delimiter')
-          return 'DECISION: PROJECT\nIn {{PROJECT_ROOT}} parse a semicolon-delimited CSV.'
+          return 'DECISION: PROJECT\nIn <PROJECT_ROOT> parse a semicolon-delimited CSV.'
         }
         return 'DECISION: READY_FOR_TARGET\npractice transferred'
       },
@@ -162,7 +162,7 @@ describe('runDeepExploration', () => {
         return 'VERDICT: PASS'
       },
     })
-    const result = await runDeepExploration({ runtime, store, config, observe: event => events.push(event) }, { lineage: 'd1', target: 'In {{PROJECT_ROOT}} convert data.csv to JSON.', stateRoot })
+    const result = await runDeepExploration({ runtime, store, config, observe: event => events.push(event) }, { lineage: 'd1', target: 'In <PROJECT_ROOT> convert data.csv to JSON.', stateRoot })
     expect(result).toMatchObject({ termination: 'verifier_pass_curriculum_ready', targetCycles: 2, practiceProjects: 1, verdict: 'PASS' })
     expect(targetAttempts).toBe(2)
     expect((await store.journal()).map(record => record.kind)).toEqual(['target', 'practice', 'target'])
@@ -174,7 +174,7 @@ describe('runDeepExploration', () => {
       actor: (_m, _o, turn) => (turn === 0 ? 'STATUS: SUBMIT' : 'ok'),
       verifier: () => 'VERDICT: PASS',
     })
-    const result = await runDeepExploration({ runtime, store, config: { ...config, stopPolicy: 'verifier_pass' }, observe: () => {} }, { lineage: 'd2', target: 'In {{PROJECT_ROOT}} do it.', stateRoot })
+    const result = await runDeepExploration({ runtime, store, config: { ...config, stopPolicy: 'verifier_pass' }, observe: () => {} }, { lineage: 'd2', target: 'In <PROJECT_ROOT> do it.', stateRoot })
     expect(result).toMatchObject({ termination: 'verifier_pass', targetCycles: 1 })
     expect(await store.journal()).toHaveLength(1)
   })
@@ -185,7 +185,7 @@ describe('runDeepExploration', () => {
       actor: (_m, _o, turn) => (turn === 0 ? 'STATUS: SUBMIT' : 'ok'),
       verifier: () => 'VERDICT: FAIL',
     })
-    const result = await runDeepExploration({ runtime, store, config, observe: () => {} }, { lineage: 'd3', target: 'In {{PROJECT_ROOT}} do it.', stateRoot })
+    const result = await runDeepExploration({ runtime, store, config, observe: () => {} }, { lineage: 'd3', target: 'In <PROJECT_ROOT> do it.', stateRoot })
     expect(result).toMatchObject({ termination: 'curriculum_stalled_final_target_test', targetCycles: 2, verdict: 'FAIL' })
   })
 
@@ -206,7 +206,7 @@ describe('runDeepExploration', () => {
         return 'VERDICT: PASS'
       },
     })
-    const result = await runDeepExploration({ runtime, store, config: { ...config, stopPolicy: 'verifier_pass' }, observe: () => {} }, { lineage: 'd4', target: 'In {{PROJECT_ROOT}} do it.', stateRoot })
+    const result = await runDeepExploration({ runtime, store, config: { ...config, stopPolicy: 'verifier_pass' }, observe: () => {} }, { lineage: 'd4', target: 'In <PROJECT_ROOT> do it.', stateRoot })
     expect(result).toMatchObject({ termination: 'verifier_pass', verdict: 'PASS' })
     expect(runtime.opened.filter(options => options.role === 'verifier')).toHaveLength(1)
   })

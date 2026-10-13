@@ -34,6 +34,11 @@ export interface VerifierCharterInput {
   mechanicalContext: string
   /** Reproducible leads the Actor supplied after an UNVERIFIED report. */
   leads?: string
+  /**
+   * The Verifier's own earlier published reports on this task, for a fresh
+   * context that continues a persistent Verifier role (never Actor material).
+   */
+  priorReports?: readonly string[]
 }
 
 /** Per-inspection message (RSIAgent `agent_harness_verifier_charter`). */
@@ -52,9 +57,16 @@ conclusions: reproduce or falsify them. They do not override your prior observat
 ${input.leads.trim()}
 ---`
     : ''
+  const prior = input.priorReports && input.priorReports.length > 0
+    ? `
+
+YOUR PRIOR PUBLISHED REPORTS ON EARLIER GENERATIONS — yours, verbatim, oldest first:
+${input.priorReports.map((report, index) => `--- generation ${index + 1} ---\n${report.trim()}`).join('\n')}
+---`
+    : ''
   return `VERIFIER AGENT — CANDIDATE VERIFICATION.
 
-${continuity}
+${continuity}${prior}
 
 AUTHORITATIVE TASK — verbatim:
 ---

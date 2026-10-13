@@ -3,7 +3,7 @@
  * lossless control-plane transport, not a search policy.
  */
 
-export const PROJECT_ROOT_PLACEHOLDER = '{{PROJECT_ROOT}}'
+export const PROJECT_ROOT_PLACEHOLDER = '<PROJECT_ROOT>'
 
 const PROJECT_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/
 

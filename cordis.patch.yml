@@ -1,0 +1,13 @@
+# dsh-rsi bundle layer: one root-level row. Its tools, prompt section, and
+# commands are global registrations, so every agent preset sees them; role
+# sub-agents are scoped by the plugin itself.
+#
+# Override this row by id in your profile's cordis.patch.yml. A patch replaces
+# the whole `config`, so restate every key you set there.
+- insert:
+    - id: dsh-rsi
+      name: dsh-rsi
+      config:
+        mode: learn
+        stateDir: .dsh-rsi
+        subagentProvider: spawn

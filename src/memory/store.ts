@@ -176,6 +176,11 @@ export class MemoryStore {
     return manifestOf(await walk(this.canonicalDir))
   }
 
+  /** Manifest of another tree the store owns, such as a wave snapshot or a draft. */
+  async manifestAt(dir: string): Promise<Manifest> {
+    return manifestOf(await walk(dir))
+  }
+
   async treeHash(): Promise<string> {
     return manifestHash(await this.manifest())
   }

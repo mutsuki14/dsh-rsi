@@ -15,6 +15,19 @@ export interface AuditConfig {
 export interface VerifierConfig {
   allowUnverified: boolean
   transportRetries: number
+  taskMessages: number
+  denyTools: string[]
+}
+
+export interface RoleRoute {
+  provider?: string
+  model?: string
+}
+
+export interface RolesConfig {
+  actor: RoleRoute
+  verifier: RoleRoute
+  curriculum: RoleRoute
 }
 
 export interface ExplorationConfig {
@@ -32,10 +45,19 @@ export interface Config {
   mode: 'learn' | 'frozen'
   stateDir: string
   promptInventory: number
+  subagentProvider: string
+  roles: RolesConfig
   memory: MemoryConfig
   audit: AuditConfig
   verifier: VerifierConfig
   exploration: ExplorationConfig
+}
+
+function route(label: string): Schema<RoleRoute> {
+  return Schema.object({
+    provider: Schema.string(),
+    model: Schema.string(),
+  }).default({}).description(`Model route for ${label}.`)
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -44,7 +66,14 @@ export const Config: Schema<Config> = Schema.object({
   stateDir: Schema.string().default('.dsh-rsi')
     .description('Lineage state and durable memory. Relative paths resolve against the agent working directory.'),
   promptInventory: Schema.natural().default(40)
-    .description('Memory inventory lines (names and sizes only) placed in the system prompt.'),
+    .description('Memory inventory lines (names and sizes only) placed in the runtime context.'),
+  subagentProvider: Schema.string().default('spawn')
+    .description('Sub-agent provider for role contexts; it must start fresh children (no parent history).'),
+  roles: Schema.object({
+    actor: route('practice and target Actor Agents'),
+    verifier: route('Verifier Agents — a different model than the Actor strengthens independence'),
+    curriculum: route('the Curriculum Agent'),
+  }).default({}).description('Optional provider/model routes per role; empty fields inherit the calling agent route.'),
   memory: Schema.object({
     maxFileBytes: Schema.natural().default(64 * 1024),
     maxTotalBytes: Schema.natural().default(4 * 1024 * 1024),
@@ -61,6 +90,10 @@ export const Config: Schema<Config> = Schema.object({
       .description('Let the Verifier publish UNVERIFIED to request reproducible evidence instead of guessing.'),
     transportRetries: Schema.natural().default(2)
       .description('Same-context continuations when a role reply lacks its transport token.'),
+    taskMessages: Schema.natural().min(1).default(3)
+      .description('Most recent user messages given verbatim to the interactive Verifier as the authoritative task.'),
+    denyTools: Schema.array(Schema.string()).default(['write', 'edit'])
+      .description('File-mutating tools hidden from Verifier contexts (names that do not exist are ignored).'),
   }).default({}),
   exploration: Schema.object({
     maxWaveProjects: Schema.natural().min(1).default(4),

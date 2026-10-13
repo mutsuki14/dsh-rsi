@@ -3,7 +3,7 @@ import { join } from 'node:path'
 import type { CommitRecord, MemoryStore } from '../memory/store.ts'
 import { parseDecision, type Verdict } from '../protocol/tokens.ts'
 import { parseWave, PROJECT_ROOT_PLACEHOLDER, type WaveProject } from '../protocol/wave.ts'
-import { practiceActorCharter, targetActorCharter, unverifiedMessage } from '../roles/actor.ts'
+import { engineActorSystem, practiceActorCharter, targetActorCharter, unverifiedMessage } from '../roles/actor.ts'
 import {
   CURRICULUM_SYSTEM,
   curriculumTransportContinuation,
@@ -13,7 +13,6 @@ import {
   type DeepDecision,
 } from '../roles/curriculum.ts'
 import { verifierSystem } from '../roles/verifier.ts'
-import { actorProtocol } from '../roles/actor.ts'
 import { inspect, learn, runHandoffPhase } from './steps.ts'
 import { InfraError, type EngineObserver, type MemoryBinding, type RoleConversation, type RoleRuntime } from './types.ts'
 import { describeDelta, discardableCopy, projectManifest } from './workspace.ts'
@@ -148,7 +147,7 @@ async function runProject(lineage: Lineage, project: WaveProject, episodeDir: st
   const actor = await runtime.open({
     role: 'actor',
     label: `${lineage.id}/${project.id} actor`,
-    system: actorProtocol('learn', false),
+    system: engineActorSystem(),
     cwd: root,
     memory: binding,
   })
@@ -353,7 +352,7 @@ export async function runDeepExploration(deps: EngineDeps, input: { lineage: str
       await rm(cycleDir, { recursive: true, force: true })
       await mkdir(root, { recursive: true })
       const binding = readBinding(store.canonicalDir)
-      const actor = await runtime.open({ role: 'actor', label: `${input.lineage} target#${targetCycles} actor`, system: actorProtocol('learn', true), cwd: root, memory: binding })
+      const actor = await runtime.open({ role: 'actor', label: `${input.lineage} target#${targetCycles} actor`, system: engineActorSystem(), cwd: root, memory: binding })
       let verdict: Verdict
       let report: string
       let diagnosis = ''

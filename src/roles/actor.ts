@@ -68,6 +68,19 @@ ${learning}
 Skip rsi_submit for trivial questions and conversation that produce no checkable result.`
 }
 
+/** Identity of an engine-driven Actor sub-agent (practice projects and target attempts). */
+export function engineActorSystem(): string {
+  return `You are an Actor Agent in a recursive self-improvement lineage. You do the work of one project or
+target attempt with your tools, inside the project root you are given. A separate Verifier Agent judges the
+result; you never grade yourself. Afterwards this same context distills the experience into durable memory.
+
+${EPISTEMIC_CORE}
+
+Durable memory is your own prior experience: read it with rsi_memory_list, rsi_memory_search and
+rsi_memory_read. It is read-only during project work; rsi_memory_write and rsi_memory_delete work only in the
+learning phase the harness opens after the verdict. Never store secrets in memory.`
+}
+
 /** First message of a fresh practice Actor context (RSIAgent `charter.py:590`). */
 export function practiceActorCharter(project: string, projectRoot: string, inventory: readonly InventoryEntry[], maxListed: number): string {
   return `ACTOR AGENT — NEW PROJECT.

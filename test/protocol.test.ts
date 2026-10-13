@@ -30,8 +30,8 @@ describe('parseVerdict', () => {
 describe('parseDecision', () => {
   const allowed = ['PROJECT', 'READY_FOR_TARGET', 'STALLED'] as const
   it('reads the first non-empty line and keeps the body verbatim', () => {
-    expect(parseDecision('\n\nDECISION: PROJECT\nBuild a parser in {{PROJECT_ROOT}}.', allowed))
-      .toEqual({ decision: 'PROJECT', body: 'Build a parser in {{PROJECT_ROOT}}.' })
+    expect(parseDecision('\n\nDECISION: PROJECT\nBuild a parser in <PROJECT_ROOT>.', allowed))
+      .toEqual({ decision: 'PROJECT', body: 'Build a parser in <PROJECT_ROOT>.' })
   })
   it('rejects tokens outside the mode vocabulary or not on the first line', () => {
     expect(parseDecision('DECISION: SATURATED', allowed)).toBeUndefined()
@@ -41,19 +41,19 @@ describe('parseDecision', () => {
 
 describe('parseWave', () => {
   it('accepts a fenced WAVE envelope', () => {
-    const text = 'Here is the wave.\n```json\n{"decision":"WAVE","rationale":"probe CLI","projects":[{"id":"csv-1","instruction":"In {{PROJECT_ROOT}} write a CSV merger."}]}\n```'
-    expect(parseWave(text, 4)).toEqual({ decision: 'WAVE', rationale: 'probe CLI', projects: [{ id: 'csv-1', instruction: 'In {{PROJECT_ROOT}} write a CSV merger.' }] })
+    const text = 'Here is the wave.\n```json\n{"decision":"WAVE","rationale":"probe CLI","projects":[{"id":"csv-1","instruction":"In <PROJECT_ROOT> write a CSV merger."}]}\n```'
+    expect(parseWave(text, 4)).toEqual({ decision: 'WAVE', rationale: 'probe CLI', projects: [{ id: 'csv-1', instruction: 'In <PROJECT_ROOT> write a CSV merger.' }] })
   })
   it('accepts terminal decisions only with an empty project list', () => {
     expect(parseWave('{"decision":"SATURATED","rationale":"coverage","projects":[]}', 4)?.decision).toBe('SATURATED')
-    expect(parseWave('{"decision":"STALLED","rationale":"x","projects":[{"id":"a","instruction":"{{PROJECT_ROOT}}"}]}', 4)).toBeUndefined()
+    expect(parseWave('{"decision":"STALLED","rationale":"x","projects":[{"id":"a","instruction":"<PROJECT_ROOT>"}]}', 4)).toBeUndefined()
   })
   it('rejects bad ids, duplicates, missing roots and oversized waves', () => {
     const wave = (projects: unknown[]) => JSON.stringify({ decision: 'WAVE', rationale: 'r', projects })
-    expect(parseWave(wave([{ id: 'Bad Id', instruction: '{{PROJECT_ROOT}}' }]), 4)).toBeUndefined()
-    expect(parseWave(wave([{ id: 'a', instruction: '{{PROJECT_ROOT}}' }, { id: 'a', instruction: '{{PROJECT_ROOT}}' }]), 4)).toBeUndefined()
+    expect(parseWave(wave([{ id: 'Bad Id', instruction: '<PROJECT_ROOT>' }]), 4)).toBeUndefined()
+    expect(parseWave(wave([{ id: 'a', instruction: '<PROJECT_ROOT>' }, { id: 'a', instruction: '<PROJECT_ROOT>' }]), 4)).toBeUndefined()
     expect(parseWave(wave([{ id: 'a', instruction: 'no root' }]), 4)).toBeUndefined()
-    expect(parseWave(wave([{ id: 'a', instruction: '{{PROJECT_ROOT}}' }, { id: 'b', instruction: '{{PROJECT_ROOT}}' }]), 1)).toBeUndefined()
+    expect(parseWave(wave([{ id: 'a', instruction: '<PROJECT_ROOT>' }, { id: 'b', instruction: '<PROJECT_ROOT>' }]), 1)).toBeUndefined()
     expect(parseWave('not json', 4)).toBeUndefined()
   })
 })
