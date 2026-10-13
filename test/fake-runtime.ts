@@ -1,7 +1,8 @@
 import type { MemoryStore } from '../src/memory/store.ts'
-import type { OpenRoleOptions, RoleConversation, RoleRuntime } from '../src/engine/types.ts'
+import type { OpenRoleOptions, RoleConversation, RoleReply, RoleRuntime } from '../src/engine/types.ts'
 
-export type Script = (message: string, options: OpenRoleOptions, turn: number) => Promise<string> | string
+export type ScriptReply = string | RoleReply
+export type Script = (message: string, options: OpenRoleOptions, turn: number) => Promise<ScriptReply> | ScriptReply
 
 /** Scripted role contexts: each `open` gets its own turn counter, like a fresh dsh sub-agent. */
 export class FakeRuntime implements RoleRuntime {
@@ -16,8 +17,10 @@ export class FakeRuntime implements RoleRuntime {
     let turn = 0
     return {
       send: async message => {
-        const reply = await this.scripts[options.role](message, options, turn++)
-        this.transcript.push({ label: options.label, message, reply })
+        const raw = await this.scripts[options.role](message, options, turn++)
+        // A scripted reply counts as one tool action unless it says otherwise.
+        const reply = typeof raw === 'string' ? { text: raw, actions: 1 } : raw
+        this.transcript.push({ label: options.label, message, reply: reply.text })
         return reply
       },
       close: async () => {

@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import { parseDecision, parseVerdict } from '../src/protocol/tokens.ts'
 import { parseWave } from '../src/protocol/wave.ts'
-import { parseSubmitHandoff } from '../src/engine/steps.ts'
+import { converse } from '../src/engine/converse.ts'
+import { formatLeads, parseLeads, parseSubmitHandoff } from '../src/engine/steps.ts'
+import { TransportInfraError, type RoleConversation, type RoleReply } from '../src/engine/types.ts'
+import { memoryPreamble } from '../src/roles/actor.ts'
 
 describe('parseVerdict', () => {
   it('finds one standalone verdict anywhere in a free-form report', () => {
@@ -42,19 +45,18 @@ describe('parseDecision', () => {
 describe('parseWave', () => {
   it('accepts a fenced WAVE envelope', () => {
     const text = 'Here is the wave.\n```json\n{"decision":"WAVE","rationale":"probe CLI","projects":[{"id":"csv-1","instruction":"In <PROJECT_ROOT> write a CSV merger."}]}\n```'
-    expect(parseWave(text, 4)).toEqual({ decision: 'WAVE', rationale: 'probe CLI', projects: [{ id: 'csv-1', instruction: 'In <PROJECT_ROOT> write a CSV merger.' }] })
+    expect(parseWave(text)).toEqual({ decision: 'WAVE', rationale: 'probe CLI', projects: [{ id: 'csv-1', instruction: 'In <PROJECT_ROOT> write a CSV merger.' }] })
   })
   it('accepts terminal decisions only with an empty project list', () => {
-    expect(parseWave('{"decision":"SATURATED","rationale":"coverage","projects":[]}', 4)?.decision).toBe('SATURATED')
-    expect(parseWave('{"decision":"STALLED","rationale":"x","projects":[{"id":"a","instruction":"<PROJECT_ROOT>"}]}', 4)).toBeUndefined()
+    expect(parseWave('{"decision":"SATURATED","rationale":"coverage","projects":[]}')?.decision).toBe('SATURATED')
+    expect(parseWave('{"decision":"STALLED","rationale":"x","projects":[{"id":"a","instruction":"<PROJECT_ROOT>"}]}')).toBeUndefined()
   })
   it('rejects bad ids, duplicates, missing roots and oversized waves', () => {
     const wave = (projects: unknown[]) => JSON.stringify({ decision: 'WAVE', rationale: 'r', projects })
-    expect(parseWave(wave([{ id: 'Bad Id', instruction: '<PROJECT_ROOT>' }]), 4)).toBeUndefined()
-    expect(parseWave(wave([{ id: 'a', instruction: '<PROJECT_ROOT>' }, { id: 'a', instruction: '<PROJECT_ROOT>' }]), 4)).toBeUndefined()
-    expect(parseWave(wave([{ id: 'a', instruction: 'no root' }]), 4)).toBeUndefined()
-    expect(parseWave(wave([{ id: 'a', instruction: '<PROJECT_ROOT>' }, { id: 'b', instruction: '<PROJECT_ROOT>' }]), 1)).toBeUndefined()
-    expect(parseWave('not json', 4)).toBeUndefined()
+    expect(parseWave(wave([{ id: 'Bad Id', instruction: '<PROJECT_ROOT>' }]))).toBeUndefined()
+    expect(parseWave(wave([{ id: 'a', instruction: '<PROJECT_ROOT>' }, { id: 'a', instruction: '<PROJECT_ROOT>' }]))).toBeUndefined()
+    expect(parseWave(wave([{ id: 'a', instruction: 'no root' }]))).toBeUndefined()
+    expect(parseWave('not json')).toBeUndefined()
   })
 })
 
@@ -62,5 +64,60 @@ describe('parseSubmitHandoff', () => {
   it('requires STATUS: SUBMIT on the first non-empty line', () => {
     expect(parseSubmitHandoff('\nSTATUS: SUBMIT\nDone: wrote merge.py')).toBe('Done: wrote merge.py')
     expect(parseSubmitHandoff('I am finished.')).toBeUndefined()
+  })
+})
+
+describe('leads', () => {
+  it('extracts CLAIM/PROBE pairs with multi-line probes and drops narrative', () => {
+    const handoff = 'STATUS: SUBMIT\nI am confident.\nCLAIM: output exists\nPROBE: test -f out.txt && echo PASS\nCLAIM: two lines\nPROBE: python3 - <<PY\nprint("PASS")\nPY\nCLAIM: no probe'
+    expect(parseLeads(handoff)).toEqual([
+      { claim: 'output exists', probe: 'test -f out.txt && echo PASS' },
+      { claim: 'two lines', probe: 'python3 - <<PY\nprint("PASS")\nPY' },
+    ])
+  })
+  it('formats RSIAgent LEAD blocks marked NOT_RUN', () => {
+    const text = formatLeads([{ claim: 'c', probe: 'p' }])
+    expect(text).toContain('LEAD 1\nActor-stated claim: c')
+    expect(text).toContain('--- BEGIN PROBE ---\np\n--- END PROBE ---')
+    expect(text).toContain('Harness execution classification: NOT_RUN')
+  })
+})
+
+describe('converse', () => {
+  const role = (replies: RoleReply[]): RoleConversation & { sent: string[] } => {
+    const sent: string[] = []
+    return {
+      sent,
+      send: async message => {
+        sent.push(message)
+        return replies.shift() ?? { text: '', actions: 0 }
+      },
+      close: async () => {},
+    }
+  }
+  const parse = (reply: RoleReply) => (reply.text === 'ok' ? { ok: true as const, value: 1 } : { ok: false as const, detail: 'not ok' })
+  const policy = { actionlessLimit: 3, ceiling: 10 }
+
+  it('continues in the same context without a fixed retry count while the role keeps acting', async () => {
+    const r = role([{ text: 'a', actions: 2 }, { text: 'b', actions: 1 }, { text: 'c', actions: 0 }, { text: 'd', actions: 1 }, { text: 'ok', actions: 0 }])
+    await expect(converse(r, 'go', parse, detail => `again: ${detail}`, policy, 'role')).resolves.toBe(1)
+    expect(r.sent).toEqual(['go', 'again: not ok', 'again: not ok', 'again: not ok', 'again: not ok'])
+  })
+  it('ends as transport infrastructure after consecutive actionless segments', async () => {
+    const r = role([{ text: 'a', actions: 0 }, { text: 'b', actions: 0 }, { text: 'c', actions: 0 }])
+    await expect(converse(r, 'go', parse, () => 'again', policy, 'role')).rejects.toBeInstanceOf(TransportInfraError)
+  })
+  it('stops at the emergency ceiling', async () => {
+    const r = role(Array.from({ length: 20 }, () => ({ text: 'x', actions: 1 })))
+    await expect(converse(r, 'go', parse, () => 'again', { actionlessLimit: 3, ceiling: 4 }, 'role')).rejects.toThrow(/ceiling/)
+  })
+})
+
+describe('memoryPreamble', () => {
+  it('lists names and sizes but leaves brace-bearing names to rsi_memory_list', () => {
+    const text = memoryPreamble([{ path: 'a.md', bytes: 3 }, { path: 'notes/{{x}}.md', bytes: 4 }], 10)
+    expect(text).toContain('a.md  3B')
+    expect(text).not.toContain('{{')
+    expect(text).toContain('1 more (use rsi_memory_list)')
   })
 })

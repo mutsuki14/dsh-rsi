@@ -3,12 +3,20 @@ import type { Agent, AgentOptions } from '@deepseek-ai/dsh-agent'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-session'
-import type { SubagentActivation, SubagentRuntime } from '@deepseek-ai/dsh-subagent'
+import type { SubagentResult, SubagentRuntime } from '@deepseek-ai/dsh-subagent'
 import type { ToolRestriction } from '@deepseek-ai/dsh-tools'
-import { InfraError, type EngineObserver, type OpenRoleOptions, type RoleConversation, type RoleKind, type RoleRuntime } from '../engine/types.ts'
+import {
+  InfraError,
+  type EngineObserver,
+  type OpenRoleOptions,
+  type RoleConversation,
+  type RoleReply,
+  type RoleRoute,
+  type RoleRuntime,
+} from '../engine/types.ts'
 import type { MemoryStore } from '../memory/store.ts'
 import { HandoffChannel } from './channel.ts'
-import type { RoleRegistry } from './registry.ts'
+import type { RoleContext, RoleRegistry } from './registry.ts'
 
 export interface SubagentRoleRuntimeOptions {
   subagents: SubagentRuntime
@@ -17,131 +25,206 @@ export interface SubagentRoleRuntimeOptions {
   provider: string
   registry: RoleRegistry
   store: MemoryStore
-  toolFilter: (role: RoleKind) => ToolRestriction
-  agentOptions: (role: RoleKind) => AgentOptions | undefined
+  toolFilter: (role: OpenRoleOptions['role']) => ToolRestriction
+  agentOptions: (route: RoleRoute) => AgentOptions | undefined
+  /** Actor-private paths a role's file tools must not touch. */
+  hidden: (role: OpenRoleOptions['role']) => string[]
+  /** Whether Verifier children are pinned read-only at creation. */
+  readOnlyVerifier: boolean
+  /** Cancels every context this runtime opened. */
   signal: AbortSignal
+  /** Upper bound on waiting for a closed context's turn to settle before disposing it. */
+  closeTimeoutMs: number
   observe: EngineObserver
+}
+
+/** The part of a started child the conversation owns, on every supported dsh version. */
+interface ManagedChild {
+  readonly childId: SessionId
+  readonly result: Promise<SubagentResult>
+  dispose(): Promise<void>
+}
+
+interface ChildTask {
+  readonly cwd?: string
+  readonly prompt: ContentBlock[]
+  readonly parent: Agent
+  readonly persona?: string
+  readonly toolFilter?: ToolRestriction
+  readonly agentOptions?: AgentOptions
+}
+
+/** dsh >= 0.2.1-alpha.2: managed activations with a reserved child id and an initial directory. */
+interface ActivationApi {
+  startActivation(spec: { provider: string, label: string, childId?: SessionId, delivery: 'parent' | 'caller', signal: AbortSignal, request: ChildTask }): Promise<ManagedChild>
+}
+
+/** dsh 0.2.0-rc.x: one-shot runs; the provider mints the child id and the child inherits the parent directory. */
+interface OneShotApi {
+  start(name: string, request: Omit<ChildTask, 'cwd'> & { label?: string, signal: AbortSignal }): Promise<{ readonly id: SessionId, readonly result: Promise<SubagentResult>, dispose(): Promise<void> }>
+}
+
+/** Whether this host can start a role child with a reserved id in a chosen directory. */
+export function supportsActivations(subagents: SubagentRuntime): boolean {
+  return typeof (subagents as unknown as Partial<ActivationApi>).startActivation === 'function'
 }
 
 export function textOf(blocks: readonly ContentBlock[]): string {
   return blocks.map(block => (block.type === 'text' ? block.text : '')).join('').trim()
 }
 
-const HANDOFF_CONTRACT = `HANDOFF CONTRACT. Deliver every handoff the instructions ask for by calling the rsi_handoff tool with the
-complete handoff text, then keep working on whatever its result says. Do not end your turn yourself; the
-harness ends this context when the lineage no longer needs it.`
-
-export const CLOSING_MESSAGE = 'RSI CONTEXT COMPLETE. No further work is needed in this context. End your turn now without calling any tools.'
-
 /**
- * Runs role contexts as dsh sub-agents (`ctx.subagents.startActivation`,
- * caller delivery, reserved child id). A context is one long child turn whose
- * successive messages travel through the parked `rsi_handoff` call.
+ * Runs role contexts as dsh sub-agents (caller delivery, fresh context). A
+ * context is one long child turn whose successive messages travel through the
+ * parked `rsi_handoff` call; a segment that ends without a handoff is steered
+ * back into the same turn by the plugin's `agent/turn-stopping` listener.
  */
 export class SubagentRoleRuntime implements RoleRuntime {
   constructor(readonly options: SubagentRoleRuntimeOptions) {}
 
-  async open(options: OpenRoleOptions): Promise<RoleConversation> {
+  async open(options: OpenRoleOptions): Promise<SubagentConversation> {
     return new SubagentConversation(this.options, options)
   }
 }
 
-class SubagentConversation implements RoleConversation {
-  #channel = new HandoffChannel()
-  #activation: SubagentActivation | undefined
-  #childId: SessionId | undefined
-  #transcript: Array<{ message: string, reply: string }> = []
+export class SubagentConversation implements RoleConversation {
+  readonly #channel = new HandoffChannel()
+  #child: ManagedChild | undefined
+  #scope: RoleContext | undefined
+  #settled: Promise<void> | undefined
   #closed = false
 
   constructor(readonly runtime: SubagentRoleRuntimeOptions, readonly role: OpenRoleOptions) {}
 
-  async send(message: string): Promise<string> {
-    if (this.#closed) throw new InfraError(`${this.role.label}: the role context is closed`)
-    if (this.#activation === undefined) {
-      await this.#start(`${HANDOFF_CONTRACT}\n\n${message}`)
-    } else if (this.#channel.hasPendingHandoff) {
-      this.#channel.respond(message)
-    } else {
-      // The child ended its own turn; continue in a fresh child that receives the logged exchange verbatim.
-      this.runtime.observe({ type: 'ROLE_CONTEXT_REPLAYED', label: this.role.label, exchanges: this.#transcript.length })
-      const replay = this.#transcript
-        .map((entry, index) => `--- MESSAGE ${index + 1} ---\n${entry.message}\n--- YOUR HANDOFF ${index + 1} ---\n${entry.reply}`)
-        .join('\n\n')
-      await this.#start(`${HANDOFF_CONTRACT}\n\nYour previous context for this role ended early. Its complete exchange with the harness is replayed below; continue as the same role.\n\n${replay}\n\n--- NEXT MESSAGE ---\n${message}`)
-    }
-    const event = await this.#channel.next()
-    const reply = event.kind === 'handoff' ? event.text : event.output
-    this.#transcript.push({ message, reply })
-    return reply
+  get childId(): SessionId | undefined {
+    return this.#child?.childId
   }
 
+  async send(message: string): Promise<RoleReply> {
+    if (this.#closed) throw new InfraError(`${this.role.label}: the role context is closed`)
+    if (this.#child === undefined) await this.#start(message)
+    else if (!this.#channel.respond(message)) {
+      // RSIAgent never continues in a lossy copy: a context that ended is infrastructure.
+      throw new InfraError(`${this.role.label}: the role context ended its turn and cannot receive further messages`)
+    }
+    const event = await this.#channel.next()
+    return event.kind === 'handoff' ? { text: event.text, actions: event.actions } : { text: event.output, actions: event.actions }
+  }
+
+  /** Ends the context: a parked handoff concludes the child's turn without another model call. */
   async close(): Promise<void> {
     if (this.#closed) return
     this.#closed = true
-    const activation = this.#activation
-    if (!activation) return
-    this.#channel.respond(CLOSING_MESSAGE)
+    if (this.#scope) this.#scope.closing = true
+    const child = this.#child
+    if (!child) return
+    const parked = this.#channel.hasPendingHandoff
+    this.#channel.close()
     try {
-      await activation.result
-    } catch (error) {
-      // The context's work is already complete; a teardown failure is reported, not rethrown.
-      this.runtime.observe({ type: 'ROLE_CONTEXT_CLOSE_FAILED', label: this.role.label, error: String(error) })
+      if (parked && this.#settled) {
+        const timeout = new Promise<'timeout'>(resolve => {
+          const timer = setTimeout(() => resolve('timeout'), this.runtime.closeTimeoutMs)
+          timer.unref?.()
+        })
+        if ((await Promise.race([this.#settled.then(() => 'settled' as const), timeout])) === 'timeout') {
+          this.runtime.observe({ type: 'ROLE_CONTEXT_CLOSE_TIMEOUT', label: this.role.label })
+        }
+      }
     } finally {
-      if (this.#childId) this.runtime.registry.delete(this.#childId)
-      await activation.dispose().catch((error: unknown) => {
-        this.runtime.observe({ type: 'ROLE_CONTEXT_DISPOSE_FAILED', label: this.role.label, error: String(error) })
-      })
+      await this.#dispose(child)
     }
   }
 
+  /** Hard stop for cancellation: the child is disposed wherever it is. */
+  async abort(): Promise<void> {
+    this.#closed = true
+    if (this.#scope) this.#scope.closing = true
+    this.#channel.close()
+    if (this.#child) await this.#dispose(this.#child)
+  }
+
+  async #dispose(child: ManagedChild): Promise<void> {
+    this.runtime.registry.delete(child.childId)
+    await child.dispose().catch((error: unknown) => {
+      this.runtime.observe({ type: 'ROLE_CONTEXT_DISPOSE_FAILED', label: this.role.label, error: String(error) })
+    })
+  }
+
   async #start(prompt: string): Promise<void> {
-    if (this.#childId) this.runtime.registry.delete(this.#childId)
-    this.#channel = new HandoffChannel()
-    const childId = brandString<SessionId>(randomUUID())
-    this.#childId = childId
-    // Register before activation so the child's first tool call already finds its scope.
-    this.runtime.registry.set(childId, {
+    const route = this.role.route ?? this.role.role
+    const agentOptions = this.runtime.agentOptions(route)
+    const scope: RoleContext = {
       role: this.role.role,
       label: this.role.label,
       binding: this.role.memory,
       channel: this.#channel,
       store: this.runtime.store,
-    })
-    const agentOptions = this.runtime.agentOptions(this.role.role)
-    const channel = this.#channel
+      ...(this.role.notesFile === undefined ? {} : { notesFile: this.role.notesFile }),
+      hidden: this.runtime.hidden(this.role.role),
+      readOnly: this.role.role === 'verifier' && this.runtime.readOnlyVerifier,
+      closing: false,
+      sinceHandoff: 0,
+      sinceStop: 0,
+      actionlessStops: 0,
+      stops: 0,
+    }
+    this.#scope = scope
+    const task = {
+      parent: this.runtime.parent,
+      persona: this.role.system,
+      toolFilter: this.runtime.toolFilter(this.role.role),
+      ...(agentOptions === undefined ? {} : { agentOptions }),
+    }
+    const api = this.runtime.subagents as unknown as Partial<ActivationApi & OneShotApi>
+    let childId: SessionId | undefined
     try {
-      this.#activation = await this.runtime.subagents.startActivation({
-        provider: this.runtime.provider,
-        label: this.role.label,
-        childId,
-        delivery: 'caller',
-        signal: this.runtime.signal,
-        request: {
-          cwd: this.role.cwd,
-          prompt: [{ type: 'text', text: prompt }],
-          parent: this.runtime.parent,
-          persona: this.role.system,
-          toolFilter: this.runtime.toolFilter(this.role.role),
-          ...(agentOptions === undefined ? {} : { agentOptions }),
-        },
-      })
+      if (typeof api.startActivation === 'function') {
+        childId = brandString<SessionId>(randomUUID())
+        // Register before activation so creation hooks and the child's first tool call find their scope.
+        this.runtime.registry.set(childId, scope)
+        this.#child = await api.startActivation({
+          provider: this.runtime.provider,
+          label: this.role.label,
+          childId,
+          delivery: 'caller',
+          signal: this.runtime.signal,
+          request: { ...task, cwd: this.role.cwd, prompt: [{ type: 'text', text: prompt }] },
+        })
+      } else if (typeof api.start === 'function') {
+        if (scope.readOnly) throw new Error('this dsh version cannot reserve a child id, so the Verifier cannot be sandboxed at creation')
+        // No initial-directory option on this host: the child starts in the parent's directory.
+        const located = `WORKING DIRECTORY: ${this.role.cwd}\nYour tools start in a different directory. Run every command inside that directory (cd into it first) or use absolute paths.\n\n${prompt}`
+        const run = await this.runtime.registry.track(api.start(this.runtime.provider, {
+          ...task,
+          label: this.role.label,
+          signal: this.runtime.signal,
+          prompt: [{ type: 'text', text: located }],
+        }))
+        childId = run.id
+        this.runtime.registry.set(childId, scope)
+        this.#child = { childId, result: run.result, dispose: () => run.dispose() }
+      } else {
+        throw new Error('ctx.subagents offers neither startActivation (dsh >= 0.2.1) nor start (dsh 0.2.0)')
+      }
     } catch (error) {
-      this.runtime.registry.delete(childId)
+      if (childId) this.runtime.registry.delete(childId)
+      this.#closed = true
       throw new InfraError(`${this.role.label}: sub-agent start failed: ${String(error)}`)
     }
     this.runtime.observe({ type: 'ROLE_CONTEXT_STARTED', label: this.role.label, role: this.role.role, childId })
-    const activation = this.#activation
+    const child = this.#child
+    const channel = this.#channel
     const onAbort = () => {
-      void activation.dispose().catch(() => undefined)
+      void this.abort()
     }
-    this.runtime.signal.addEventListener('abort', onAbort, { once: true })
-    void activation.result.finally(() => this.runtime.signal.removeEventListener('abort', onAbort)).catch(() => undefined)
-    this.#activation.result.then(
-      result => {
-        if (result.stopReason === 'completed') channel.end(textOf(result.output))
+    if (this.runtime.signal.aborted) onAbort()
+    else this.runtime.signal.addEventListener('abort', onAbort, { once: true })
+    this.#settled = child.result.then(
+      (result: SubagentResult) => {
+        if (result.stopReason === 'completed') channel.end(textOf(result.output), scope.sinceHandoff)
         else channel.fail(new InfraError(`${this.role.label}: sub-agent stopped (${result.stopReason})${result.diagnostic ? `: ${result.diagnostic}` : ''}`))
       },
       (error: unknown) => channel.fail(new InfraError(`${this.role.label}: sub-agent failed: ${String(error)}`)),
-    )
+    ).finally(() => this.runtime.signal.removeEventListener('abort', onAbort))
   }
 }

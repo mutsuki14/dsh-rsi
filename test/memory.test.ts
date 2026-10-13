@@ -140,3 +140,57 @@ describe('workspaceState', () => {
     expect(untracked.tracked).toBe(false)
   })
 })
+
+describe('MemoryStore durability', () => {
+  let root: string
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'dsh-rsi-durable-'))
+  })
+
+  it('reopens a draft from disk in a fresh store instance after a restart', async () => {
+    const first = new MemoryStore(root, limits, { keepHistory: false })
+    await first.init()
+    const draft = await first.openDraft('task-s1-7')
+    await first.writeDraft(draft, 'lesson.md', 'survives restarts')
+    const second = new MemoryStore(root, limits, { keepHistory: false })
+    await second.init()
+    const reopened = await second.reopenDraft('task-s1-7')
+    expect(reopened?.baseHash).toBe(draft.baseHash)
+    await second.commit(reopened!, { kind: 'task', outcome: 'PASS' })
+    expect((await second.read('lesson.md')).text).toBe('survives restarts')
+    expect(await second.reopenDraft('task-s1-7')).toBeUndefined()
+    expect(await second.findCommit('task-s1-7')).toMatchObject({ episode: 'task-s1-7', outcome: 'PASS' })
+  })
+
+  it('stores reports by content and refuses altered ones', async () => {
+    const store = new MemoryStore(root, limits, { keepHistory: false })
+    await store.init()
+    const ref = await store.putReport('VERDICT: PASS')
+    expect(await store.getReport(ref.sha256)).toBe('VERDICT: PASS')
+    await writeFile(join(root, 'reports', `${ref.sha256}.md`), 'VERDICT: FAIL')
+    expect(await store.getReport(ref.sha256)).toBeUndefined()
+    expect(await store.getReport('../escape')).toBeUndefined()
+  })
+
+  it('tolerates a torn final journal line', async () => {
+    const store = new MemoryStore(root, limits, { keepHistory: false })
+    await store.init()
+    const draft = await store.openDraft('e')
+    await store.writeDraft(draft, 'a.md', 'a')
+    await store.commit(draft, { kind: 'practice', outcome: 'PASS' })
+    await writeFile(join(root, 'journal.jsonl'), `${await readFile(join(root, 'journal.jsonl'), 'utf8')}{"episode":"tor`)
+    expect((await store.journal()).map(record => record.episode)).toEqual(['e'])
+  })
+
+  it('cleans up drafts of already-committed episodes at init', async () => {
+    const store = new MemoryStore(root, limits, { keepHistory: false })
+    await store.init()
+    const draft = await store.openDraft('done')
+    await store.writeDraft(draft, 'a.md', 'a')
+    await store.commit(draft, { kind: 'practice', outcome: 'PASS' })
+    await mkdir(join(root, 'drafts', 'done'), { recursive: true })
+    await writeFile(join(root, 'drafts', 'done.json'), JSON.stringify({ v: 1, episode: 'done', baseHash: '0'.repeat(64), baseManifest: {}, createdAt: '' }))
+    await new MemoryStore(root, limits, { keepHistory: false }).init()
+    expect(await readdir(join(root, 'drafts'))).toEqual([])
+  })
+})

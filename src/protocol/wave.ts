@@ -27,7 +27,7 @@ export function extractJsonObject(text: string): string | undefined {
 }
 
 /** Returns `undefined` for any malformed envelope; callers ask the same context to republish. */
-export function parseWave(text: string, maxProjects: number): WaveDecision | undefined {
+export function parseWave(text: string): WaveDecision | undefined {
   const raw = extractJsonObject(text)
   if (raw === undefined) return undefined
   let value: unknown
@@ -44,7 +44,7 @@ export function parseWave(text: string, maxProjects: number): WaveDecision | und
     if (projects.length > 0) return undefined
     return { decision, rationale: rationale.trim(), projects: [] }
   }
-  if (decision !== 'WAVE' || projects.length === 0 || projects.length > maxProjects) return undefined
+  if (decision !== 'WAVE' || projects.length === 0) return undefined
   const seen = new Set<string>()
   const parsed: WaveProject[] = []
   for (const record of projects) {

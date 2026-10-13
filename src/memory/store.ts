@@ -42,21 +42,29 @@ export interface MemoryDelta {
 }
 
 export class MemoryFrozenError extends Error {
+  readonly code = 'RSI_MEMORY_FROZEN'
   constructor() {
     super('memory is frozen: test-time reuse never updates durable memory')
   }
 }
 
 export class MemoryConflictError extends Error {
+  readonly code = 'RSI_MEMORY_CONFLICT'
   constructor(readonly expected: string, readonly actual: string) {
     super('durable memory changed after this draft was opened; reopen the learning phase against the current memory')
   }
 }
 
+/** Deliberately neutral: like RSIAgent's silent audit, the reason never reaches an agent. */
 export class MemoryQuarantineError extends Error {
+  readonly code = 'RSI_MEMORY_QUARANTINED'
   constructor() {
-    super('the candidate memory was quarantined by the leakage audit; durable memory is unchanged')
+    super('this learning phase could not be promoted; durable memory is unchanged')
   }
+}
+
+export class MemoryLimitError extends Error {
+  readonly code = 'RSI_MEMORY_LIMIT'
 }
 
 export function diffManifests(before: Manifest, after: Manifest): MemoryDelta {
@@ -133,6 +141,20 @@ export class MemoryDraft {
   ) {}
 }
 
+interface DraftMeta {
+  v: 1
+  episode: string
+  baseHash: string
+  baseManifest: Manifest
+  createdAt: string
+}
+
+function draftDirName(episode: string): string {
+  return safeRelativePath(episode).replace(/\//g, '_')
+}
+
+const SHA256_HEX = /^[0-9a-f]{64}$/
+
 /**
  * Durable, Actor-owned experience memory (RSIAgent `~/.memory` plus the host
  * commit pipeline). Layout under `root`:
@@ -146,7 +168,7 @@ export class MemoryDraft {
 export class MemoryStore {
   readonly canonicalDir: string
   readonly #drafts = new Map<string, MemoryDraft>()
-  #commitChain: Promise<unknown> = Promise.resolve()
+  #chain: Promise<unknown> = Promise.resolve()
 
   constructor(
     readonly root: string,
@@ -170,6 +192,33 @@ export class MemoryStore {
       }
     }
     await mkdir(this.canonicalDir, { recursive: true })
+    // Drafts whose episode already reached the journal are leftovers of a crash after promotion.
+    const committed = new Set((await this.journal()).map(record => record.episode))
+    for (const name of await readdir(join(this.root, 'drafts')).catch(() => [] as string[])) {
+      if (!name.endsWith('.json')) continue
+      const meta = await this.#readDraftMeta(join(this.root, 'drafts', name))
+      if (meta && committed.has(meta.episode)) {
+        await rm(join(this.root, 'drafts', draftDirName(meta.episode)), { recursive: true, force: true })
+        await rm(join(this.root, 'drafts', name), { force: true })
+      }
+    }
+  }
+
+  /** Runs store mutations one at a time (open, commit, discard). */
+  #serial<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.#chain.then(task)
+    this.#chain = run.catch(() => undefined)
+    return run
+  }
+
+  async #readDraftMeta(path: string): Promise<DraftMeta | undefined> {
+    try {
+      const meta = JSON.parse(await readFile(path, 'utf8')) as DraftMeta
+      return meta.v === 1 && typeof meta.episode === 'string' && SHA256_HEX.test(meta.baseHash) ? meta : undefined
+    } catch {
+      // A missing or torn metadata file means the draft was never completely opened.
+      return undefined
+    }
   }
 
   async manifest(): Promise<Manifest> {
@@ -242,17 +291,41 @@ export class MemoryStore {
     return this.#drafts.get(episode)
   }
 
-  /** Copies the current canonical tree into a fresh draft for one episode's learning phase. */
-  async openDraft(episode: string): Promise<MemoryDraft> {
-    if (await this.isFrozen()) throw new MemoryFrozenError()
-    const existing = this.#drafts.get(episode)
-    if (existing) return existing
-    const dir = join(this.root, 'drafts', safeRelativePath(episode).replace(/\//g, '_'))
-    await rm(dir, { recursive: true, force: true })
-    await mkdir(dirname(dir), { recursive: true })
-    await cp(this.canonicalDir, dir, { recursive: true })
-    const baseManifest = await this.manifest()
-    const draft = new MemoryDraft(episode, dir, manifestHash(baseManifest), baseManifest)
+  /**
+   * Copies the current canonical tree into a fresh draft for one episode's
+   * learning phase. Its metadata is written after the copy completes, so a
+   * restarted process can reopen exactly that draft.
+   */
+  openDraft(episode: string): Promise<MemoryDraft> {
+    return this.#serial(async () => {
+      if (await this.isFrozen()) throw new MemoryFrozenError()
+      const existing = this.#drafts.get(episode) ?? (await this.#reopen(episode))
+      if (existing) return existing
+      const dir = join(this.root, 'drafts', draftDirName(episode))
+      await rm(dir, { recursive: true, force: true })
+      await mkdir(dirname(dir), { recursive: true })
+      await cp(this.canonicalDir, dir, { recursive: true })
+      const baseManifest = manifestOf(await walk(dir))
+      const draft = new MemoryDraft(episode, dir, manifestHash(baseManifest), baseManifest)
+      const meta: DraftMeta = { v: 1, episode, baseHash: draft.baseHash, baseManifest, createdAt: new Date().toISOString() }
+      const metaPath = `${dir}.json`
+      await writeFile(`${metaPath}.tmp`, `${JSON.stringify(meta)}\n`)
+      await rename(`${metaPath}.tmp`, metaPath)
+      this.#drafts.set(episode, draft)
+      return draft
+    })
+  }
+
+  /** Reopens a draft from disk after a restart; `undefined` when it is gone or incomplete. */
+  reopenDraft(episode: string): Promise<MemoryDraft | undefined> {
+    return this.#serial(async () => this.#drafts.get(episode) ?? this.#reopen(episode))
+  }
+
+  async #reopen(episode: string): Promise<MemoryDraft | undefined> {
+    const dir = join(this.root, 'drafts', draftDirName(episode))
+    const meta = await this.#readDraftMeta(`${dir}.json`)
+    if (!meta || meta.episode !== episode || !(await exists(dir))) return undefined
+    const draft = new MemoryDraft(episode, dir, meta.baseHash, meta.baseManifest)
     this.#drafts.set(episode, draft)
     return draft
   }
@@ -260,7 +333,7 @@ export class MemoryStore {
   async writeDraft(draft: MemoryDraft, path: string, content: string): Promise<void> {
     const rel = safeRelativePath(path)
     const bytes = Buffer.byteLength(content, 'utf8')
-    if (bytes > this.limits.maxFileBytes) throw new Error(`memory file ${rel} is ${bytes} bytes; the limit is ${this.limits.maxFileBytes}`)
+    if (bytes > this.limits.maxFileBytes) throw new MemoryLimitError(`memory file ${rel} is ${bytes} bytes; the limit is ${this.limits.maxFileBytes}`)
     const full = join(draft.dir, rel)
     await mkdir(dirname(full), { recursive: true })
     await writeFile(full, content, 'utf8')
@@ -273,15 +346,44 @@ export class MemoryStore {
     return true
   }
 
+  /** Content-addressed Verifier report, outside every role's working directory. */
+  async putReport(text: string): Promise<{ sha256: string, bytes: number }> {
+    const digest = sha256(text)
+    const dir = join(this.root, 'reports')
+    await mkdir(dir, { recursive: true })
+    const path = join(dir, `${digest}.md`)
+    if (!(await exists(path))) {
+      await writeFile(`${path}.tmp`, text, 'utf8')
+      await rename(`${path}.tmp`, path)
+    }
+    return { sha256: digest, bytes: Buffer.byteLength(text, 'utf8') }
+  }
+
+  /** The report with this digest, or `undefined` when missing or altered. */
+  async getReport(digest: string): Promise<string | undefined> {
+    if (!SHA256_HEX.test(digest)) return undefined
+    try {
+      const text = await readFile(join(this.root, 'reports', `${digest}.md`), 'utf8')
+      return sha256(text) === digest ? text : undefined
+    } catch {
+      // A lost report is reported to the caller as unavailable rather than guessed.
+      return undefined
+    }
+  }
+
+  async findCommit(episode: string): Promise<CommitRecord | undefined> {
+    return (await this.journal()).find(record => record.episode === episode)
+  }
+
   async draftManifest(draft: MemoryDraft): Promise<Manifest> {
     return manifestOf(await walk(draft.dir))
   }
 
   async discardDraft(episode: string): Promise<void> {
-    const draft = this.#drafts.get(episode)
-    if (!draft) return
     this.#drafts.delete(episode)
-    await rm(draft.dir, { recursive: true, force: true })
+    const dir = join(this.root, 'drafts', draftDirName(episode))
+    await rm(dir, { recursive: true, force: true })
+    await rm(`${dir}.json`, { force: true })
   }
 
   /**
@@ -291,9 +393,7 @@ export class MemoryStore {
    * canonical is refused rather than silently overwriting a sibling commit.
    */
   commit(draft: MemoryDraft, meta: { kind: EpisodeKind, outcome: TerminalOutcome }): Promise<CommitRecord> {
-    const run = this.#commitChain.then(() => this.#commit(draft, meta))
-    this.#commitChain = run.catch(() => undefined)
-    return run
+    return this.#serial(() => this.#commit(draft, meta))
   }
 
   async #commit(draft: MemoryDraft, meta: { kind: EpisodeKind, outcome: TerminalOutcome }): Promise<CommitRecord> {
@@ -304,10 +404,10 @@ export class MemoryStore {
     const files = await walk(draft.dir)
     const after = manifestOf(files)
     const total = Object.values(after).reduce((sum, entry) => sum + entry.bytes, 0)
-    if (files.size > this.limits.maxFiles) throw new Error(`memory would hold ${files.size} files; the limit is ${this.limits.maxFiles}`)
-    if (total > this.limits.maxTotalBytes) throw new Error(`memory would hold ${total} bytes; the limit is ${this.limits.maxTotalBytes}`)
+    if (files.size > this.limits.maxFiles) throw new MemoryLimitError(`memory would hold ${files.size} files; the limit is ${this.limits.maxFiles}`)
+    if (total > this.limits.maxTotalBytes) throw new MemoryLimitError(`memory would hold ${total} bytes; the limit is ${this.limits.maxTotalBytes}`)
     for (const [path, entry] of Object.entries(after)) {
-      if (entry.bytes > this.limits.maxFileBytes) throw new Error(`memory file ${path} exceeds ${this.limits.maxFileBytes} bytes`)
+      if (entry.bytes > this.limits.maxFileBytes) throw new MemoryLimitError(`memory file ${path} exceeds ${this.limits.maxFileBytes} bytes`)
     }
     if (this.options.audit?.enabled) {
       const text = new Map([...files].map(([path, data]) => [path, data.toString('utf8')] as const))
@@ -344,15 +444,22 @@ export class MemoryStore {
     }
     this.#drafts.delete(draft.episode)
     await rm(draft.dir, { recursive: true, force: true })
+    await rm(`${draft.dir}.json`, { force: true })
     return record
   }
 
   async journal(): Promise<CommitRecord[]> {
     const path = join(this.root, 'journal.jsonl')
     if (!(await exists(path))) return []
-    return (await readFile(path, 'utf8'))
-      .split('\n')
-      .filter(line => line.trim() !== '')
-      .map(line => JSON.parse(line) as CommitRecord)
+    const records: CommitRecord[] = []
+    for (const line of (await readFile(path, 'utf8')).split('\n')) {
+      if (line.trim() === '') continue
+      try {
+        records.push(JSON.parse(line) as CommitRecord)
+      } catch {
+        // A torn final line from an interrupted append is not a record.
+      }
+    }
+    return records
   }
 }

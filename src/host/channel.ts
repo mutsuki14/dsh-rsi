@@ -8,13 +8,15 @@
  * same-context continuity RSIAgent requires — without new loop machinery.
  */
 
+/** Resolves a parked handoff when the engine has no further message: the role ends its turn. */
+export const CLOSED: unique symbol = Symbol('dsh-rsi.closed')
+
 export type ChannelEvent =
-  | { kind: 'handoff', text: string }
-  | { kind: 'ended', output: string }
+  | { kind: 'handoff', text: string, actions: number }
+  | { kind: 'ended', output: string, actions: number }
 
 interface Pending {
-  text: string
-  respond: (message: string) => void
+  respond: (message: string | typeof CLOSED) => void
   reject: (error: Error) => void
 }
 
@@ -24,37 +26,42 @@ export class HandoffChannel {
   #waiter: { resolve: (event: ChannelEvent) => void, reject: (error: Error) => void } | undefined
   #failure: Error | undefined
   #ended = false
+  #closed = false
 
   get ended(): boolean {
     return this.#ended
+  }
+
+  get closed(): boolean {
+    return this.#closed
   }
 
   get hasPendingHandoff(): boolean {
     return this.#pending !== undefined
   }
 
-  /** Child side: publishes `text` and waits for the engine's next message. */
-  handoff(text: string, signal: AbortSignal): Promise<string> {
+  /** Child side: publishes `text` and waits for the engine's next message, or CLOSED. */
+  handoff(text: string, actions: number, signal: AbortSignal): Promise<string | typeof CLOSED> {
+    if (this.#closed) return Promise.resolve(CLOSED)
     if (this.#pending) return Promise.reject(new Error('a handoff is already pending; wait for its reply'))
-    return new Promise<string>((respond, reject) => {
+    return new Promise<string | typeof CLOSED>((resolve, reject) => {
       const onAbort = () => {
-        if (this.#pending?.respond === respondOnce) this.#pending = undefined
+        if (this.#pending === pending) this.#pending = undefined
         reject(new Error('rsi_handoff was cancelled'))
       }
-      const respondOnce = (message: string) => {
-        signal.removeEventListener('abort', onAbort)
-        respond(message)
-      }
-      this.#pending = {
-        text,
-        respond: respondOnce,
+      const pending: Pending = {
+        respond: message => {
+          signal.removeEventListener('abort', onAbort)
+          resolve(message)
+        },
         reject: error => {
           signal.removeEventListener('abort', onAbort)
           reject(error)
         },
       }
+      this.#pending = pending
       signal.addEventListener('abort', onAbort, { once: true })
-      this.#emit({ kind: 'handoff', text })
+      this.#emit({ kind: 'handoff', text, actions })
     })
   }
 
@@ -65,6 +72,14 @@ export class HandoffChannel {
     this.#pending = undefined
     pending.respond(message)
     return true
+  }
+
+  /** Engine side: no further messages; a parked or future handoff ends the role's turn. */
+  close(): void {
+    this.#closed = true
+    const pending = this.#pending
+    this.#pending = undefined
+    pending?.respond(CLOSED)
   }
 
   /** Engine side: waits for the next handoff or the end of the child's turn. */
@@ -78,15 +93,17 @@ export class HandoffChannel {
   }
 
   /** The child's turn settled with its final assistant output. */
-  end(output: string): void {
+  end(output: string, actions: number): void {
+    if (this.#ended) return
     this.#ended = true
     this.#pending?.reject(new Error('the role context ended'))
     this.#pending = undefined
-    this.#emit({ kind: 'ended', output })
+    this.#emit({ kind: 'ended', output, actions })
   }
 
   /** The child failed below the protocol (infrastructure). */
   fail(error: Error): void {
+    if (this.#ended) return
     this.#ended = true
     this.#failure = error
     this.#pending?.reject(error)

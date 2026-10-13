@@ -1,9 +1,9 @@
-import type { MemoryStore, CommitRecord, EpisodeKind, TerminalOutcome } from '../memory/store.ts'
+import type { CommitRecord, EpisodeKind, MemoryStore, TerminalOutcome } from '../memory/store.ts'
 import { parseUniqueToken, parseVerdict } from '../protocol/tokens.ts'
-import { distillationMessage, learningDiagnosisMessage, reconciliationMessage } from '../roles/actor.ts'
+import { distillationMessage, learningDiagnosisMessage, reconciliationMessage, transportContinuation } from '../roles/actor.ts'
 import { verifierCharter, verifierTransportContinuation, type VerifierCharterInput } from '../roles/verifier.ts'
-import type { MemoryBinding, RoleConversation, VerificationResult } from './types.ts'
-import { InfraError } from './types.ts'
+import { converse } from './converse.ts'
+import { InfraError, type MemoryBinding, type RoleConversation, type TransportPolicy, type VerificationResult } from './types.ts'
 
 const STATUS_SUBMIT = /STATUS:\s*(SUBMIT)/
 
@@ -18,38 +18,102 @@ export function parseSubmitHandoff(text: string): string | undefined {
   return lines.slice(first + 1).join('\n').trim()
 }
 
-export const HANDOFF_CONTINUATION = `SAME-CONTEXT TRANSPORT CONTINUATION. Your turn ended without a handoff whose first non-empty
-line is exactly "STATUS: SUBMIT". If project work remains, continue it; when you decide to stop, end your
-turn with the complete handoff.`
+export interface Lead {
+  claim: string
+  probe: string
+}
 
-/** Runs an Actor work phase until it publishes a SUBMIT handoff; an actionless lineage is infrastructure, not a verdict. */
-export async function runHandoffPhase(actor: RoleConversation, opening: string, retries: number, signal?: AbortSignal): Promise<string> {
-  let reply = await actor.send(opening, signal)
-  for (let attempt = 0; ; attempt++) {
-    const handoff = parseSubmitHandoff(reply)
-    if (handoff !== undefined) return handoff
-    if (attempt >= retries) throw new InfraError('the Actor Agent never published a STATUS: SUBMIT handoff')
-    reply = await actor.send(HANDOFF_CONTINUATION, signal)
+/** Extracts CLAIM/PROBE pairs; a PROBE continues until the next CLAIM or PROBE line. */
+export function parseLeads(handoff: string): Lead[] {
+  const leads: Lead[] = []
+  let claim: string | undefined
+  let probe: string[] | undefined
+  const flush = () => {
+    if (claim !== undefined && probe !== undefined && probe.join('\n').trim() !== '') leads.push({ claim, probe: probe.join('\n').trim() })
+    probe = undefined
   }
+  for (const line of handoff.split(/\r?\n/)) {
+    const claimMatch = /^\s*CLAIM:\s*(.*)$/.exec(line)
+    const probeMatch = /^\s*PROBE:\s*(.*)$/.exec(line)
+    if (claimMatch) {
+      flush()
+      claim = claimMatch[1]!.trim()
+    } else if (probeMatch) {
+      flush()
+      probe = [probeMatch[1]!]
+    } else if (probe !== undefined) {
+      probe.push(line)
+    }
+  }
+  flush()
+  return leads
+}
+
+/** RSIAgent's LEAD blocks (loop.py:459-464); the harness does not execute probes, so each is NOT_RUN. */
+export function formatLeads(leads: readonly Lead[]): string {
+  return leads.map((lead, index) => `LEAD ${index + 1}
+Actor-stated claim: ${lead.claim}
+Exact reproducible probe proposed by Actor:
+--- BEGIN PROBE ---
+${lead.probe}
+--- END PROBE ---
+Harness execution classification: NOT_RUN`).join('\n\n')
+}
+
+export interface HandoffOptions {
+  signal?: AbortSignal
+  /** Extra transport check of a parsed handoff, e.g. the project-root shape gate. */
+  validate?: (body: string) => Promise<string | undefined>
+}
+
+/** Runs an Actor work phase in the same context until it publishes a usable SUBMIT handoff. */
+export async function runHandoffPhase(actor: RoleConversation, opening: string, policy: TransportPolicy, options: HandoffOptions = {}): Promise<string> {
+  return converse(
+    actor,
+    opening,
+    async reply => {
+      const body = parseSubmitHandoff(reply.text)
+      if (body === undefined) return { ok: false, detail: 'the first non-empty line of the handoff must be exactly "STATUS: SUBMIT"' }
+      const problem = await options.validate?.(body)
+      return problem === undefined ? { ok: true, value: body } : { ok: false, detail: problem }
+    },
+    detail => transportContinuation('ACTOR', detail),
+    policy,
+    'Actor Agent',
+    options.signal,
+  )
 }
 
 export interface VerifyOptions extends VerifierCharterInput {
   allowUnverified: boolean
-  retries: number
+  policy: TransportPolicy
   signal?: AbortSignal
 }
 
 /**
- * One inspection by a (possibly persistent) Verifier context. A report without
- * a valid verdict after the transport retries is infrastructure, never PASS or FAIL.
+ * One inspection by a (possibly persistent) Verifier context. A context that
+ * never publishes a valid verdict is infrastructure, never PASS or FAIL.
  */
 export async function inspect(verifier: RoleConversation, options: VerifyOptions): Promise<VerificationResult> {
-  let report = await verifier.send(verifierCharter(options), options.signal)
-  for (let attempt = 0; ; attempt++) {
-    const verdict = parseVerdict(report, options.allowUnverified)
-    if (verdict !== undefined) return { kind: 'verdict', verdict, report }
-    if (attempt >= options.retries) return { kind: 'infra', reason: 'the Verifier Agent did not publish exactly one valid verdict' }
-    report = await verifier.send(verifierTransportContinuation(options.allowUnverified), options.signal)
+  try {
+    return await converse(
+      verifier,
+      verifierCharter(options),
+      reply => {
+        const verdict = parseVerdict(reply.text, options.allowUnverified)
+        return verdict === undefined
+          ? { ok: false, detail: 'no single standalone verdict line' }
+          : { ok: true, value: { kind: 'verdict' as const, verdict, report: reply.text } }
+      },
+      () => verifierTransportContinuation(options.allowUnverified),
+      options.policy,
+      'Verifier Agent',
+      options.signal,
+    )
+  } catch (error) {
+    // A context that stalled or ended without a verdict is infrastructure, never a verdict.
+    if (error instanceof InfraError) return { kind: 'infra', reason: error.message }
+    throw error
   }
 }
 
@@ -60,8 +124,9 @@ export interface LearnOptions {
   kind: EpisodeKind
   outcome: TerminalOutcome
   report: string
-  /** Phase 2 asks the same Actor for a Curriculum-facing diagnosis after the commit. */
+  /** Phase 2 asks the same Actor for a Curriculum-facing diagnosis before the commit. */
   diagnosis: boolean
+  policy: TransportPolicy
   signal?: AbortSignal
 }
 
@@ -73,7 +138,8 @@ export interface LearnResult {
 /**
  * Same-context learning (RSIAgent `_promote_learning`): the Actor that did the
  * work distills into a draft opened from the *current* canonical memory,
- * reconciles the whole corpus, and the harness promotes the draft atomically.
+ * reconciles the whole corpus, writes its diagnosis, and only then does the
+ * harness promote the draft atomically.
  */
 export async function learn(actor: RoleConversation, options: LearnOptions): Promise<LearnResult> {
   const draft = await options.store.openDraft(options.episode)
@@ -84,13 +150,24 @@ export async function learn(actor: RoleConversation, options: LearnOptions): Pro
   try {
     await actor.send(distillationMessage(options.outcome, options.report, 'engine'), options.signal)
     await actor.send(reconciliationMessage('engine'), options.signal)
-    const commit = await options.store.commit(draft, { kind: options.kind, outcome: options.outcome })
+    let diagnosis: string | undefined
+    if (options.diagnosis) {
+      diagnosis = await converse(
+        actor,
+        learningDiagnosisMessage(options.outcome, options.report),
+        reply => (reply.text.trim() === '' ? { ok: false, detail: 'the diagnosis was empty' } : { ok: true, value: reply.text.trim() }),
+        detail => transportContinuation('ACTOR', detail),
+        options.policy,
+        'Actor Agent diagnosis',
+        options.signal,
+      )
+    }
+    // Promotion closes the draft view before the commit, so nothing writes into a tree being installed.
     options.binding.access = 'read'
     options.binding.draft = undefined
     options.binding.readDir = options.store.canonicalDir
-    const result: LearnResult = { commit }
-    if (options.diagnosis) result.diagnosis = await actor.send(learningDiagnosisMessage(options.outcome), options.signal)
-    return result
+    const commit = await options.store.commit(draft, { kind: options.kind, outcome: options.outcome })
+    return diagnosis === undefined ? { commit } : { commit, diagnosis }
   } catch (error) {
     await options.store.discardDraft(options.episode)
     options.binding.access = 'none'
