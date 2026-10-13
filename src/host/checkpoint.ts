@@ -93,7 +93,8 @@ export class WorkspaceCheckpoint {
           entries.set(rel, { ...info, sha256: sha256(data) })
         } catch (error) {
           if (!skippable(error)) throw error
-          if (!absent(error)) unreadable.push(rel)
+          // A file the harness cannot read is still tracked by size, time, and mode (it cannot be restored).
+          if (!absent(error)) entries.set(rel, info)
         }
       }
     } catch (error) {
