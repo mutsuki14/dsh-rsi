@@ -2,7 +2,8 @@
 // offline end-to-end check can drive a real `dsh` headless run through every RSI role.
 // Usage: node scripts/mock-deepseek.mjs <request-log.jsonl> <port>
 import { createServer } from 'node:http'
-import { appendFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 
 const log = process.argv[2]
 const port = Number(process.argv[3] ?? 18090)
@@ -28,9 +29,14 @@ function decide(body) {
     return { role: 'verifier', text: 'done' }
   }
   if (system.includes('You are the Curriculum Agent')) {
-    if (last.includes('RSI CONTEXT COMPLETE')) return { role: 'curriculum', text: 'bye' }
     if (last.includes('TERMINAL OUTCOME')) return { role: 'curriculum', tool: ['rsi_handoff', { text: '{"decision":"SATURATED","rationale":"the single probe answered the open question","projects":[]}' }] }
-    return { role: 'curriculum', tool: ['rsi_handoff', { text: JSON.stringify({ decision: 'WAVE', rationale: 'probe file deliverables', projects: [{ id: 'greet', instruction: 'In <PROJECT_ROOT> create greet.txt containing hi.' }] }) }] }
+    // Stands in for the Curriculum's own file tools: build the project's input fixture.
+    const root = /create one nonempty fixture tree per project at:\\n\s*(\S+?)\/<id>/.exec(last)?.[1]
+    if (root) {
+      mkdirSync(join(root, 'greet'), { recursive: true })
+      writeFileSync(join(root, 'greet', 'name.txt'), 'world\n')
+    }
+    return { role: 'curriculum', tool: ['rsi_handoff', { text: JSON.stringify({ decision: 'WAVE', rationale: 'probe file deliverables', projects: [{ id: 'greet', instruction: 'In <PROJECT_ROOT> create greet.txt greeting the name in name.txt.' }] }) }] }
   }
   if (system.includes('You are an Actor Agent in a recursive self-improvement lineage')) {
     if (last.includes('RSI CONTEXT COMPLETE')) return { role: 'actor', text: 'bye' }
@@ -42,6 +48,7 @@ function decide(body) {
   const request = textOf(body.messages[0]?.content)
   if (!hasToolResult && request.includes('Explore')) return { role: 'main', tool: ['rsi_explore', { phase: 'broad', direction: 'A POSIX shell workspace; practice small file tasks.', lineage: 'e2e-broad' }] }
   if (last.includes('termination')) return { role: 'main', text: `Exploration result: ${last.includes('saturated') ? 'saturated' : 'other'}` }
+  if (last.includes('rsi_explore needs dsh')) return { role: 'main', text: 'Exploration unsupported on this dsh version.' }
   if (!hasToolResult) return { role: 'main', tool: ['rsi_submit', {}] }
   if (last.includes('VERDICT: PASS') && !last.includes('MEMORY DISTILLATION')) return { role: 'main', tool: ['rsi_learn', {}] }
   if (last.includes('MEMORY DISTILLATION')) return { role: 'main', tool: ['rsi_memory_write', { path: 'procedures/greeting-files.md', content: 'Greeting files live at the workspace root; verify exact bytes with cat.' }] }

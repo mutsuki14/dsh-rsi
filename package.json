@@ -1,6 +1,6 @@
 {
   "name": "dsh-rsi",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Recursive self-improvement for DeepSeek Harness: Actor-owned experience memory, an independent Verifier Agent, and Curriculum-driven broad/deep exploration, after RSIAgent.",
   "type": "module",
   "license": "Apache-2.0",
@@ -57,27 +57,32 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "check": "pnpm run typecheck && pnpm run test",
-    "e2e": "bash scripts/e2e-headless.sh"
+    "e2e": "bash scripts/e2e-headless.sh",
+    "typecheck:legacy": "tsc -p tsconfig.legacy.json --noEmit"
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.4",
     "zod": "^4.4.3"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "~4.0.5-alpha.1",
-    "@deepseek-ai/dsh-agent": ">=0.2.1-alpha.2 <0.3.0",
-    "@deepseek-ai/dsh-brand": ">=0.2.1-alpha.2 <0.3.0",
-    "@deepseek-ai/dsh-commands": ">=0.2.1-alpha.2 <0.3.0",
-    "@deepseek-ai/dsh-llm": ">=0.2.1-alpha.2 <0.3.0",
-    "@deepseek-ai/dsh-session": ">=0.2.1-alpha.2 <0.3.0",
-    "@deepseek-ai/dsh-session-projection": ">=0.2.1-alpha.2 <0.3.0",
-    "@deepseek-ai/dsh-subagent": ">=0.2.1-alpha.2 <0.3.0",
-    "@deepseek-ai/dsh-system-prompt": ">=0.2.1-alpha.2 <0.3.0",
-    "@deepseek-ai/dsh-tools": ">=0.2.1-alpha.2 <0.3.0",
-    "@deepseek-ai/dsh-working-directory": ">=0.2.1-alpha.2 <0.3.0"
+    "@deepseek-ai/cordis": ">=4.0.4 <4.1.0-0",
+    "@deepseek-ai/dsh-agent": ">=0.2.0-rc.2 <0.2.1-0 || >=0.2.1-alpha.2 <0.3.0-0",
+    "@deepseek-ai/dsh-brand": ">=0.2.0-rc.2 <0.2.1-0 || >=0.2.1-alpha.2 <0.3.0-0",
+    "@deepseek-ai/dsh-commands": ">=0.2.0-rc.2 <0.2.1-0 || >=0.2.1-alpha.2 <0.3.0-0",
+    "@deepseek-ai/dsh-llm": ">=0.2.0-rc.2 <0.2.1-0 || >=0.2.1-alpha.2 <0.3.0-0",
+    "@deepseek-ai/dsh-sandbox-policy": ">=0.2.0-rc.2 <0.2.1-0 || >=0.2.1-alpha.2 <0.3.0-0",
+    "@deepseek-ai/dsh-session": ">=0.2.0-rc.2 <0.2.1-0 || >=0.2.1-alpha.2 <0.3.0-0",
+    "@deepseek-ai/dsh-session-projection": ">=0.2.0-rc.2 <0.2.1-0 || >=0.2.1-alpha.2 <0.3.0-0",
+    "@deepseek-ai/dsh-subagent": ">=0.2.0-rc.2 <0.2.1-0 || >=0.2.1-alpha.2 <0.3.0-0",
+    "@deepseek-ai/dsh-system-prompt": ">=0.2.0-rc.2 <0.2.1-0 || >=0.2.1-alpha.2 <0.3.0-0",
+    "@deepseek-ai/dsh-tools": ">=0.2.0-rc.2 <0.2.1-0 || >=0.2.1-alpha.2 <0.3.0-0",
+    "@deepseek-ai/dsh-working-directory": ">=0.2.0-rc.2 <0.2.1-0 || >=0.2.1-alpha.2 <0.3.0-0"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/dsh-commands": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-sandbox-policy": {
       "optional": true
     },
     "@deepseek-ai/dsh-working-directory": {

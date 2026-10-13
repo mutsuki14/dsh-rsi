@@ -138,8 +138,11 @@ export function applyTask(state: TaskState, event: SessionEvent): TaskState {
       const next = { ...state, pending }
       return event.data.message.isError === true || event.data.meta === undefined ? next : settle(next, event.seq, event.data.meta)
     }
-    case 'tool/ptc-dispatch':
-      return isStateTool(event.data.name) && !event.data.isError && event.data.meta !== undefined ? settle(state, event.seq, event.data.meta) : state
+    case 'tool/ptc-dispatch': {
+      // dsh 0.2.0 records no meta on PTC sub-dispatches; there the fold simply sees none.
+      const meta = (event.data as { meta?: unknown }).meta
+      return isStateTool(event.data.name) && !event.data.isError && meta !== undefined ? settle(state, event.seq, meta) : state
+    }
     case 'turn/end':
       return Object.keys(state.pending).length === 0 ? state : { ...state, pending: {} }
     default:

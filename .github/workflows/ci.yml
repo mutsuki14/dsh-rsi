@@ -7,6 +7,10 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dsh: ['0.2.1-alpha.2', '0.2.0-rc.2']
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -16,8 +20,21 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm run typecheck
-      - run: pnpm run test
+      - name: Install (committed lockfile, alpha line)
+        if: matrix.dsh == '0.2.1-alpha.2'
+        run: pnpm install --frozen-lockfile
+      - name: Install (rc line)
+        if: matrix.dsh != '0.2.1-alpha.2'
+        run: |
+          node scripts/use-dsh.mjs ${{ matrix.dsh }}
+          pnpm install --no-frozen-lockfile
+      - name: Typecheck
+        run: ${{ matrix.dsh == '0.2.1-alpha.2' && 'pnpm run typecheck' || 'pnpm run typecheck:legacy' }}
+      - name: Unit and real-runtime tests
+        run: pnpm run test
+        env:
+          DSH_LEGACY: ${{ matrix.dsh == '0.2.1-alpha.2' && '' || '1' }}
       - name: Offline dsh headless end-to-end
         run: pnpm run e2e
+        env:
+          DSH_VERSION: ${{ matrix.dsh }}
