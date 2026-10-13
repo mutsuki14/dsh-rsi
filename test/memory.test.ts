@@ -314,4 +314,78 @@ describe('MemoryStore durability', () => {
     expect(await readdir(join(target, 'memory'))).toEqual(['procedures'])
   })
 
+
+  it('lets the Actor condense an over-limit draft in place, refusing only growth', async () => {
+    const roomy = new MemoryStore(root, { maxFileBytes: 4096, maxTotalBytes: 10_000, maxFiles: 8 }, { keepHistory: false })
+    await roomy.init()
+    const first = await roomy.openDraft('big')
+    await roomy.writeDraft(first, 'a.md', 'a'.repeat(3000))
+    await roomy.writeDraft(first, 'b.md', 'b'.repeat(3000))
+    await roomy.commit(first, { kind: 'practice', outcome: 'PASS' })
+    // The limits were lowered after memory grew: the next draft starts over them.
+    const tight = new MemoryStore(root, { maxFileBytes: 4096, maxTotalBytes: 4000, maxFiles: 8 }, { keepHistory: false })
+    await tight.init()
+    const draft = await tight.openDraft('trim')
+    await tight.writeDraft(draft, 'a.md', 'a'.repeat(1500))
+    await expect(tight.writeDraft(draft, 'b.md', 'b'.repeat(3500))).rejects.toThrow(/limit is 4000/)
+    await expect(tight.commit(draft, { kind: 'practice', outcome: 'PASS' })).rejects.toThrow(/4500 bytes/)
+    await tight.writeDraft(draft, 'b.md', 'b'.repeat(1000))
+    expect((await tight.commit(draft, { kind: 'practice', outcome: 'PASS' })).bytes).toBe(2500)
+  })
+
+  it('takes over a lock left by an earlier process with the same pid, or whose heartbeat stopped', async () => {
+    const { hostname } = await import('node:os')
+    const { utimes } = await import('node:fs/promises')
+    const store = new MemoryStore(root, limits, { keepHistory: false, lockTimeoutMs: 2_000 })
+    await store.init()
+    // A container restart reuses pid 1: same pid and host, but another process's token.
+    await writeFile(join(root, '.lock'), JSON.stringify({ pid: process.pid, host: hostname(), token: 'earlier-process:x' }))
+    expect((await store.openDraft('a')).episode).toBe('a')
+    // Another host (or a recycled live pid) whose lease ran out.
+    await writeFile(join(root, '.lock'), JSON.stringify({ pid: 1, host: 'another-container', token: 't' }))
+    const old = new Date(Date.now() - 60_000)
+    await utimes(join(root, '.lock'), old, old)
+    expect((await store.openDraft('b')).episode).toBe('b')
+    // A live lock elsewhere is respected until the timeout.
+    await writeFile(join(root, '.lock'), JSON.stringify({ pid: 1, host: 'another-container', token: 't' }))
+    await expect(store.openDraft('c')).rejects.toThrow(/held by another process/)
+  })
+
+  it('promotes one experience once, whichever session (or fork) commits it first', async () => {
+    const store = new MemoryStore(root, limits, { keepHistory: false })
+    await store.init()
+    const fork = await store.openDraft('task-fork-7')
+    const parent = await store.openDraft('task-parent-7')
+    await store.writeDraft(fork, 'lesson.md', 'from the fork')
+    await store.writeDraft(parent, 'lesson.md', 'from the parent')
+    const first = await store.commit(fork, { kind: 'task', outcome: 'PASS', origin: 'task-parent-7' })
+    const second = await store.commit(parent, { kind: 'task', outcome: 'PASS', origin: 'task-parent-7' })
+    expect(second).toEqual(first)
+    expect(await store.journal()).toHaveLength(1)
+    expect(await store.findCommit('task-parent-7')).toEqual(first)
+    expect((await store.read('lesson.md')).text).toBe('from the fork')
+  })
+
+  it('sweeps drafts of engine runs whose process is gone, and keeps interactive drafts', async () => {
+    const { hostname } = await import('node:os')
+    const store = new MemoryStore(root, limits, { keepHistory: false })
+    await store.init()
+    await store.openDraft('task-s-1')
+    await store.openDraft('lin-t1', { fresh: true })
+    const metaPath = join(root, 'drafts', 'lin-t1.json')
+    const meta = JSON.parse(await readFile(metaPath, 'utf8')) as Record<string, unknown>
+    await writeFile(metaPath, JSON.stringify({ ...meta, process: { pid: 2 ** 22 + 4321, host: hostname() } }))
+    await new MemoryStore(root, limits, { keepHistory: false }).init()
+    expect((await readdir(join(root, 'drafts'))).sort()).toEqual(['task-s-1', 'task-s-1.json'])
+  })
+
+  it('runs a one-time preparation inside the store lock', async () => {
+    const store = new MemoryStore(root, limits, { keepHistory: false })
+    let sawLock = false
+    await store.init(async () => {
+      sawLock = (await readdir(root)).includes('.lock')
+    })
+    expect(sawLock).toBe(true)
+  })
+
 })

@@ -85,7 +85,7 @@ export const Config: Schema<Config> = Schema.object({
   mode: Schema.union(['learn', 'frozen']).default('learn')
     .description('`learn` runs verify → distill → reconcile → commit after tasks; `frozen` is test-time reuse: memory is read-only.'),
   stateDir: Schema.string().default('')
-    .description('Where lineage project roots (what role agents work in) live. Empty: $DSH_HOME/rsi-work/<project>-<hash>, outside the user\'s workspace and its git repository. Relative paths resolve against the session project directory.'),
+    .description('Where lineage project roots (what role agents work in) live. Empty: <project>/.dsh-rsi/work, inside the workspace (role agents can write only there under workspace-write) but ignored by and separate from the user\'s git repository. Relative paths resolve against the session project directory.'),
   memoryDir: Schema.string().default('')
     .description('Durable memory, drafts, journal, reports, and lineage records. Empty: $DSH_HOME/rsi/<project>-<hash>, outside the workspace, like RSIAgent host-side memory.'),
   promptInventory: Schema.natural().default(40)

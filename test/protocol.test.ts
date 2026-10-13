@@ -2,9 +2,10 @@ import { describe, expect, it } from 'vitest'
 import { parseDecision, parseVerdict } from '../src/protocol/tokens.ts'
 import { parseWave } from '../src/protocol/wave.ts'
 import { converse } from '../src/engine/converse.ts'
-import { formatLeads, parseLeads, parseSubmitHandoff } from '../src/engine/steps.ts'
+import { formatLeads, leadsProblem, parseLeads, parseSubmitHandoff } from '../src/engine/steps.ts'
 import { TransportInfraError, type RoleConversation, type RoleReply } from '../src/engine/types.ts'
 import { memoryPreamble } from '../src/roles/actor.ts'
+import { verifierSystem } from '../src/roles/verifier.ts'
 
 describe('parseVerdict', () => {
   it('finds one standalone verdict anywhere in a free-form report', () => {
@@ -94,6 +95,35 @@ describe('leads', () => {
     expect(parseLeads('STATUS: SUBMIT\nCLAIM: sorted\nPROBE: sort -c out.txt && echo PASS\n\nI fixed parse.py; the task is complete.'))
       .toEqual([{ claim: 'sorted', probe: 'sort -c out.txt && echo PASS' }])
   })
+  it('takes an inline fence as a one-line probe and never lets a fence swallow narrative or the next pair', () => {
+    const handoff = [
+      'STATUS: SUBMIT',
+      'CLAIM: a exists',
+      'PROBE: ```test -f a && echo PASS```',
+      'I rewrote parse.py and all my own tests pass; the task is complete.',
+      'CLAIM: b exists',
+      'PROBE:',
+      '```sh',
+      'test -f b && echo PASS',
+      '```',
+    ].join('\n')
+    expect(parseLeads(handoff)).toEqual([
+      { claim: 'a exists', probe: 'test -f a && echo PASS' },
+      { claim: 'b exists', probe: 'test -f b && echo PASS' },
+    ])
+    expect(leadsProblem(handoff)).toBeUndefined()
+    const unterminated = 'STATUS: SUBMIT\nCLAIM: a\nPROBE:\n```\ncat a\nmy narrative\nCLAIM: b\nPROBE: test -f b && echo PASS'
+    expect(parseLeads(unterminated)).toEqual([{ claim: 'b', probe: 'test -f b && echo PASS' }])
+    expect(leadsProblem(unterminated)).toContain('never closed')
+  })
+  it('rejects a multi-line probe given without a fence instead of truncating it', () => {
+    const heredoc = "STATUS: SUBMIT\nCLAIM: works\nPROBE: python3 - <<'EOF'\nimport sys\nprint('PASS')\nEOF"
+    expect(leadsProblem(heredoc)).toContain('continues onto later lines')
+    expect(parseLeads(heredoc)).toEqual([])
+    expect(leadsProblem('STATUS: SUBMIT\nCLAIM: c\nPROBE: grep -q x a \\\n  && echo PASS')).toContain('continues onto later lines')
+    expect(leadsProblem('STATUS: SUBMIT\nCLAIM: c\nPROBE: cat <<< "x" | grep -q x && echo PASS')).toBeUndefined()
+    expect(leadsProblem('STATUS: SUBMIT\nno pairs here')).toContain('no CLAIM/PROBE')
+  })
   it('formats RSIAgent LEAD blocks marked NOT_RUN', () => {
     const text = formatLeads([{ claim: 'c', probe: 'p' }])
     expect(text).toContain('LEAD 1\nActor-stated claim: c')
@@ -140,3 +170,13 @@ describe('memoryPreamble', () => {
     expect(text).toContain('1 more (use rsi_memory_list)')
   })
 })
+
+describe('verifier prompt', () => {
+  it('claims only the isolation the sandbox provides', () => {
+    const sandbox = verifierSystem(false, 'sandbox')
+    expect(sandbox).toContain('never mutate live')
+    expect(sandbox).toContain('Network access and other processes are NOT isolated')
+    expect(sandbox).not.toContain('effect-isolated')
+  })
+})
+

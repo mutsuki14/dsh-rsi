@@ -761,4 +761,60 @@ describe('dsh-rsi inside the real harness', () => {
     expect(Rsi.effectiveRoute(main, { model: 'pro' })).toEqual({ provider: 'mock', model: 'pro' })
   })
 
+
+  it('lets role agents write their work roots under the default workspace-write sandbox, outside the user\'s git status', async () => {
+    const { execFileSync } = await import('node:child_process')
+    execFileSync('git', ['init', '-q'], { cwd: workspace })
+    let curriculumCalls = 0
+    const adapter = new RouterAdapter({
+      main: (options, call) => {
+        if (call === 0) return toolCall('e0', 'rsi_explore', { phase: 'broad', direction: 'Small file tasks.', lineage: 'sbx' })
+        expect(lastMessage(options)).toContain('saturated')
+        return textResponse('done')
+      },
+      curriculum: (options, call) => {
+        const last = lastMessage(options)
+        curriculumCalls++
+        if (call === 0) {
+          const root = /create one nonempty fixture tree per project at:\\n\s+(\S+)\/<id>/.exec(last)![1]!
+          // The Curriculum authors its fixture with its own sandboxed file tool.
+          return toolCall('c0', 'write', { file_path: `${root}/greet/name.txt`, content: 'world' })
+        }
+        if (call === 1) {
+          expect(last).not.toContain('denied')
+          return toolCall('c1', 'rsi_handoff', { text: JSON.stringify({ decision: 'WAVE', rationale: 'probe', projects: [{ id: 'greet', instruction: 'In <PROJECT_ROOT> create greet.txt saying hi.' }] }) })
+        }
+        return toolCall(`c${call}`, 'rsi_handoff', { text: '{"decision":"SATURATED","rationale":"enough","projects":[]}' })
+      },
+      actor: (options, call) => {
+        const last = lastMessage(options)
+        if (call === 0) {
+          const root = /PROJECT ROOT: (\S+)/.exec(last)![1]!.replace(/\\n.*$/, '')
+          return toolCall('a0', 'bash', { description: 'write the output', command: `cd ${root} && printf hi > greet.txt && echo rc=$?` })
+        }
+        if (call === 1) {
+          expect(last).toContain('rc=0')
+          return toolCall('a1', 'rsi_handoff', { text: 'STATUS: SUBMIT\nCreated greet.txt.' })
+        }
+        if (last.includes('MEMORY DISTILLATION')) return toolCall(`a${call}`, 'rsi_handoff', { text: 'Nothing new to keep.' })
+        return toolCall(`a${call}`, 'rsi_handoff', { text: 'Reconciled.' })
+      },
+      verifier: (options, call) => {
+        if (call === 0) return toolCall('v0', 'bash', { description: 'inspect', command: `cat ${/Candidate root: (\S+)/.exec(lastMessage(options))![1]!.replace(/\\n.*$/, '')}/greet.txt` })
+        expect(lastMessage(options)).toContain('hi')
+        return toolCall('v1', 'rsi_handoff', { text: 'greet.txt says hi.\nVERDICT: PASS' })
+      },
+    })
+    const { ctx, main } = await sandboxedHarness(adapter)
+    await ask(ctx, main, 'Explore.')
+    expect(adapter.errors).toEqual([])
+    const [result] = toolResults(main)
+    expect(result).toMatchObject({ name: 'rsi_explore', isError: false })
+    expect(JSON.parse(result!.text)).toMatchObject({ termination: 'saturated', projects: [{ id: 'greet', verdict: 'PASS' }] })
+    expect(curriculumCalls).toBe(3)
+    // The work root is inside the workspace yet invisible to the user's repository.
+    expect(existsSync(join(workspace, '.dsh-rsi', 'work', 'lineages', 'sbx'))).toBe(true)
+    expect(execFileSync('git', ['status', '--porcelain'], { cwd: workspace, encoding: 'utf8' })).toBe('')
+  })
+
 })

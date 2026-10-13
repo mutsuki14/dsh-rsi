@@ -46,7 +46,7 @@ import { workspaceState } from './host/git.ts'
 import { applyRoleIsolation, decideIsolation, privatePathGuard, type GuardedExecution, type IsolationDecision } from './host/isolation.ts'
 import { RoleRegistry, startPhase, type RoleContext } from './host/registry.ts'
 import { runSealedEvaluation } from './host/sealed.ts'
-import { dshHome, StoreRegistry } from './host/stores.ts'
+import { dshHome, prepareWorkRoot, StoreRegistry } from './host/stores.ts'
 import { SubagentRoleRuntime, supportsActivations, type SubagentConversation } from './host/subagent-runtime.ts'
 import { applyTask, episodeFor, initTask, STATE_TOOLS, taskStateSchema, type TaskMeta, type TaskState } from './host/task-state.ts'
 
@@ -117,6 +117,11 @@ function isSubagent(agent: Agent | undefined): boolean {
 /** Optional services typed structurally, so the plugin loads on hosts that do not compose them. */
 function service<T>(ctx: Context, key: string): T | undefined {
   return (ctx as unknown as { get(name: string): unknown }).get(key) as T | undefined
+}
+
+/** dsh aborts a turn with a plain cause object, which a thrown value would render as "[object Object]". */
+function throwIfCancelled(signal: AbortSignal, what: string): void {
+  if (signal.aborted) throw signal.reason instanceof Error ? signal.reason : new Error(`${what} was cancelled`)
 }
 
 /** A role route as it will run: empty fields inherit the agent's live route, like dsh child options. */
@@ -216,11 +221,11 @@ export function apply(ctx: Context, config: Config): void {
       return undefined
     }
     if (isSubagent(agent)) return undefined
-    try {
-      await stores.forAgent(agent)
-    } catch (error) {
+    // Agent creation waits briefly for the inventory, never for another process's store lock.
+    const opening = stores.forAgent(agent).then(() => undefined, (error: unknown) => {
       logger.warn('could not open RSI memory for %s: %s', agent.id, error)
-    }
+    })
+    await Promise.race([opening, new Promise<void>(resolve => setTimeout(resolve, 5_000).unref?.())])
     return undefined
   })
   ctx.on('agent/disposed', ({ agent }) => {
@@ -585,7 +590,7 @@ export function apply(ctx: Context, config: Config): void {
       if (newTask || verifiers.get(agent.id)?.conversation.ended) await closeVerifier(agent.id)
       const generation = (newTask ? 0 : task.generation) + 1
       const excludes = harnessPaths(cwd, agent, store)
-      exec.signal.throwIfAborted()
+      throwIfCancelled(exec.signal, 'rsi_submit')
       const before = await workspaceState(cwd, excludes)
       let checkpoint: WorkspaceCheckpoint
       try {
@@ -598,7 +603,7 @@ export function apply(ctx: Context, config: Config): void {
       let changed: string[] = []
       let onAbort: (() => void) | undefined
       try {
-        exec.signal.throwIfAborted()
+        throwIfCancelled(exec.signal, 'rsi_submit')
         let live = verifiers.get(agent.id)
         const fresh = live === undefined
         if (!live) {
@@ -653,7 +658,7 @@ export function apply(ctx: Context, config: Config): void {
           await checkpoint.dispose()
         }
       }
-      exec.signal.throwIfAborted()
+      throwIfCancelled(exec.signal, 'rsi_submit')
       if (result.kind === 'infra') {
         await closeVerifier(agent.id)
         throw new Error(`verification is unavailable: ${result.reason}. This is an infrastructure failure, not a verdict.`)
@@ -705,9 +710,9 @@ export function apply(ctx: Context, config: Config): void {
       if (task.verdictSeq === null) throw new Error('rsi_learn needs a recorded verdict')
       if (task.closedVerdictSeq === task.verdictSeq) throw new Error('the learning phase for this verdict already ended; durable memory was not changed')
       const episode = episodeFor(agent.id, task.verdictSeq)
-      // A fork inherits its origin's verdict: whichever session learned from it first, it is learned once.
-      const origin = task.verdictSession !== null && task.verdictSession !== agent.id ? episodeFor(task.verdictSession, task.verdictSeq) : undefined
-      for (const candidate of origin === undefined ? [episode] : [episode, origin]) {
+      // The verdict's origin is shared by the session that recorded it and every fork: it is learned once.
+      const origin = episodeFor(task.verdictSession ?? agent.id, task.verdictSeq)
+      for (const candidate of new Set([episode, origin])) {
         if (await store.findCommit(candidate)) {
           return stateResult('This experience was already promoted to durable memory; there is nothing left to learn from it.', { rsi: 1, op: 'commit', episode })
         }
@@ -737,9 +742,11 @@ export function apply(ctx: Context, config: Config): void {
       const task = taskOf(agent)
       const learning = task.learning
       if (!learning) throw new Error('no learning phase is open; call rsi_learn after a terminal verdict')
+      const origin = episodeFor(task.verdictSession ?? agent.id, learning.verdictSeq)
       if (learning.owner !== agent.id) throw new Error('the open learning phase belongs to another session; call rsi_learn to open this session\'s own')
       const store = await stores.forAgent(agent)
-      if (await store.findCommit(learning.episode)) {
+      if ((await store.findCommit(learning.episode)) || (await store.findCommit(origin))) {
+        await store.discardDraft(learning.episode)
         await stores.refresh(store)
         return stateResult('This learning phase was already promoted to durable memory.', { rsi: 1, op: 'commit', episode: learning.episode })
       }
@@ -754,13 +761,13 @@ export function apply(ctx: Context, config: Config): void {
       if (learning.stage === 'distill') return stateResult(reconciliationMessage('actor'), { rsi: 1, op: 'reconcile', episode: learning.episode })
       const draft = await store.reopenDraft(learning.episode)
       if (!draft) {
-        if (await store.isQuarantined(learning.episode)) {
+        if ((await store.isQuarantined(learning.episode)) || (await store.isQuarantined(origin))) {
           return stateResult('this learning phase could not be promoted; durable memory is unchanged', { rsi: 1, op: 'close', episode: learning.episode, terminal: true })
         }
         return stateResult('The learning draft no longer exists, so nothing was promoted. Call rsi_learn to redo the learning phase against the current memory.', { rsi: 1, op: 'close', episode: learning.episode, terminal: false })
       }
       try {
-        const record = await store.commit(draft, { kind: 'task', outcome: learning.outcome })
+        const record = await store.commit(draft, { kind: 'task', outcome: learning.outcome, origin })
         await stores.refresh(store)
         return stateResult(
           `Memory promoted (${record.outcome} experience). created: ${record.created.join(', ') || '-'}; modified: ${record.modified.join(', ') || '-'}; deleted: ${record.deleted.join(', ') || '-'}. Tree ${record.treeAfter.slice(0, 12)}, ${record.files} files.`,
@@ -855,7 +862,7 @@ export function apply(ctx: Context, config: Config): void {
       const lineage = args.lineage ?? `${args.phase}-${new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14)}`
       if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(lineage)) throw new Error('lineage must match [a-z0-9][a-z0-9_-]{0,63}')
       const workRoot = stores.stateRoot(projectDir)
-      await mkdir(workRoot, { recursive: true })
+      await prepareWorkRoot(workRoot)
       const decision = await requireIsolation(workRoot)
       const paths = { workspace: join(stores.stateRoot(projectDir), 'lineages', lineage), private: join(store.root, 'lineages', lineage) }
       // Lineages are not resumable: a started id (finished or interrupted) is never reused, so its episodes stay unique.

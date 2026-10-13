@@ -7,23 +7,27 @@ const run = promisify(execFile)
 /**
  * Harness-side git never runs repository-configured code. The Actor (or a
  * Verifier in rollback mode) can write `.git/config` and `.gitattributes`, so
- * every invocation disables fsmonitor and hooks, ignores attribute files
- * outside the tree, and neutralizes every filter and diff driver the
- * repository (rather than the user's own global configuration) defines.
+ * every invocation disables fsmonitor and hooks and neutralizes every filter
+ * and diff driver the repository defines. System and global configuration
+ * belong to the user and the administrator (a sandboxed role cannot write
+ * them), so their settings — line endings, LFS, safe.directory — still apply.
  */
 const SAFE = [
   '-c', 'core.fsmonitor=false',
   '-c', 'core.hooksPath=/dev/null',
   '-c', 'core.untrackedCache=false',
-  '-c', 'core.attributesFile=/dev/null',
   '-c', 'diff.external=',
 ]
 
-const ENV = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0', GIT_EXTERNAL_DIFF: '', GIT_OPTIONAL_LOCKS: '0' }
+/** Read per call, so a changed environment (e.g. GIT_CONFIG_SYSTEM) takes effect. */
+const env = () => ({ ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_EXTERNAL_DIFF: '', GIT_OPTIONAL_LOCKS: '0' })
+
+/** Configuration scopes a role can never write. */
+const TRUSTED_SCOPES = new Set(['global', 'system'])
 
 async function raw(cwd: string, args: string[]): Promise<string | undefined> {
   try {
-    const { stdout } = await run('git', args, { cwd, env: ENV, timeout: 15_000, maxBuffer: 32 * 1024 * 1024 })
+    const { stdout } = await run('git', args, { cwd, env: env(), timeout: 15_000, maxBuffer: 32 * 1024 * 1024 })
     return stdout
   } catch {
     // Not a repository, git missing, or a timeout: the caller treats capture as unavailable.
@@ -34,12 +38,12 @@ async function raw(cwd: string, args: string[]): Promise<string | undefined> {
 const DRIVER_KEY = /^(filter|diff)\.(.+)\.(clean|smudge|process|required|command|textconv|cachetextconv)$/i
 
 /**
- * `-c` overrides that disable every filter and diff driver not defined by the
- * user's global configuration. `undefined` when the configuration cannot be
- * read: then git is not run at all (fail closed).
+ * `-c` overrides that disable every filter and diff driver defined outside the
+ * user's global and system configuration. `undefined` when the configuration
+ * cannot be read: then git is not run at all (fail closed).
  */
 async function driverOverrides(cwd: string): Promise<string[] | undefined> {
-  // `--show-scope` (git >= 2.26) separates repository-planted drivers from the user's own.
+  // `--show-scope` (git >= 2.26) separates repository-planted drivers from the user's and administrator's.
   let listing = await raw(cwd, [...SAFE, 'config', '--show-scope', '--name-only', '--get-regexp', '^(filter|diff)\\.'])
   let scoped = true
   if (listing === undefined) {
@@ -57,7 +61,7 @@ async function driverOverrides(cwd: string): Promise<string[] | undefined> {
   for (const line of listing.split('\n')) {
     if (line.trim() === '') continue
     const [scope, key] = scoped ? line.split('\t') as [string, string | undefined] : ['unknown', line]
-    if (key === undefined || scope === 'global') continue
+    if (key === undefined || TRUSTED_SCOPES.has(scope)) continue
     const match = DRIVER_KEY.exec(key.trim())
     if (!match) continue
     const id = `${match[1]!.toLowerCase()}.${match[2]}`

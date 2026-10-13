@@ -109,7 +109,7 @@ Commands (human-only; command results never reach the model):
 
 In every mode the interactive candidate (the session's project: tracked and untracked-but-not-ignored files) is checkpointed before an inspection and restored if it changed; files that existed before (ignored ones included) are never deleted, and a workspace too large to copy is compared by size and time and reported. Practice and target project roots are copied whole and restored when anything in them changed, `.git` and dependency trees included.
 
-Host-side `git` (change facts, checkpoints) never runs repository-planted programs: hooks, fsmonitor, external diff, textconv, and filter drivers the repository defines are disabled.
+Host-side `git` (change facts, checkpoints) never runs repository-planted programs: hooks, fsmonitor, external diff, and the filter, diff, and textconv drivers the repository defines are disabled. Global and system configuration (line endings, LFS, `safe.directory`) still applies.
 
 ## Configuration
 
@@ -120,7 +120,7 @@ Override the row by id in your profile's `cordis.patch.yml`. An override replace
   name: dsh-rsi
   config:
     mode: learn                # frozen = Phase 3 test-time reuse
-    stateDir: ''               # '' = $DSH_HOME/rsi-work/<project>-<hash>: lineage project roots, outside the workspace
+    stateDir: ''               # '' = <project>/.dsh-rsi/work: lineage project roots (role agents can write only in the workspace)
     memoryDir: ''              # '' = $DSH_HOME/rsi/<project>-<hash>, outside the workspace
     subagentProvider: spawn
     roles:                     # optional model routes; a different Verifier model strengthens independence
@@ -169,24 +169,25 @@ $DSH_HOME/rsi/<project>-<hash>/     (memoryDir; outside every role's working dir
   .lock                  cross-process mutation lock (two dsh processes in one project)
   lineages/<id>/         events.jsonl, result.json, curriculum_notes.md, fixture captures, wave snapshots, final-candidate/
   sealed/<id>/<run>/     sealed evaluations (candidate copy, task, evaluation.json)
-$DSH_HOME/rsi-work/<project>-<hash>/lineages/<id>/   practice and target project roots (what roles work in)
+<project>/.dsh-rsi/work/lineages/<id>/   practice and target project roots (what roles work in; a separate,
+                                          self-ignoring git repository, so the user's status stays clean)
 ```
 
 The tree hash matches RSIAgent's `tree_sha256` byte for byte, and a unit test checks this. Memory written by dsh-rsi 0.1 inside the workspace (`<project>/.dsh-rsi`) is moved here on first use.
 
-Memory limits (`memory.maxFiles`, `maxTotalBytes`, `maxFileBytes`) are stated in the learning prompts and enforced as the Actor writes; a draft that still ends up over a limit goes back to the same Actor to trim. `/rsi-eval` scores the private `final-candidate/` copy and refuses one whose digest changed after the lineage ended.
+Memory limits (`memory.maxFiles`, `maxTotalBytes`, `maxFileBytes`) are stated in the learning prompts; writes that would grow memory past them are refused (condensing is always allowed), and a draft that still ends up over a limit goes back to the same Actor to trim. The `.lock` is a lease: a lock left by a crashed process is taken over once its heartbeat stops. `/rsi-eval` scores the private `final-candidate/` copy and refuses one whose digest changed after the lineage ended.
 
 ## Remaining differences from RSIAgent
 
 These follow from what dsh provides today; each is stated so nothing claims more than it delivers.
 
 - **No private writable scratch for a sandboxed Verifier.** dsh's read-only mode has no extra writable root, so the Verifier cannot write even to `/tmp` (as RSIAgent's practice Verifiers). RSIAgent's target Verifier also gets a private `VERIFIER_SCRATCH` tmpfs. Use `rollback` isolation when verification needs writes.
-- **Read hiding and network/process isolation are not mechanical.** dsh confines writes only. File tools refuse Actor-private paths and those paths live outside the workspace and are never disclosed, but a determined `bash` could still read them, reach local services, or signal other processes; RSIAgent uses namespaces.
+- **Read hiding and network/process isolation are not mechanical.** dsh confines writes only. File tools refuse Actor-private paths and those paths live outside the workspace and are never disclosed, but a determined `bash` could still read them, reach local services, or signal other processes; RSIAgent uses namespaces. The Verifier is told so and told never to mutate live services.
 - **Interactive Verifier continuity spans one main-agent turn.** dsh hosts wait for children at the turn boundary, so the live context closes there; in a later turn a fresh context continues from its own published reports. Lineage Verifiers persist for the whole attempt.
 - **Evidence leads are `NOT_RUN`.** The harness forwards CLAIM/PROBE pairs (and nothing else) but does not execute them; RSIAgent classifies them by running the Actor's validated checks.
 - **A memory conflict asks for a new learning phase.** If canonical memory changed after a draft was opened, the draft is discarded and the Actor relearns against current memory; RSIAgent's recovery path refuses instead.
-- **Exploration lineages are not resumable after a restart**; interactive learning phases are. Drafts of sessions that are never resumed stay on disk until removed by hand.
-- **Forks.** A forked session that inherits an unlearned verdict can learn from it independently of its origin; once either has promoted it, the other is told it is already learned.
+- **Exploration lineages are not resumable after a restart**; interactive learning phases are. Drafts of interrupted lineages are swept on the next start; drafts of interactive sessions that are never resumed stay on disk until removed by hand.
+- **Forks.** A verdict is learned once across a session and its forks: whichever promotes it first wins, and the others are told it is already learned.
 - **On dsh 0.2.0-rc.2**, `rsi_explore` is refused (role children cannot start in their own project root), Verifier isolation is `rollback`, and the interactive tools must be called directly rather than from `run_code` (that version records no structured result for `run_code` sub-calls).
 
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) maps each RSIAgent mechanism to its implementation here.

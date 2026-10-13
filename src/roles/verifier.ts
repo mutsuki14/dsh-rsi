@@ -9,11 +9,13 @@ export type VerifierMechanics = 'sandbox' | 'rollback'
 
 function mechanicsText(mechanics: VerifierMechanics): string {
   return mechanics === 'sandbox'
-    ? `Your file tools and processes are mechanically effect-isolated from the candidate: the filesystem is
-read-only for you, including temporary directories, and escalation is rejected. Never set sandbox_permissions;
-a "[sandbox: file access denied …]" marker means the boundary worked. Analyze in memory or through command
-output, and prefer tool options that avoid caches or temporary files. These mechanics protect the scored state
-without prescribing your method.`
+    ? `Your file tools and processes cannot write files: the filesystem is read-only for you, including temporary
+directories, and escalation is rejected. Never set sandbox_permissions; a "[sandbox: file access denied …]"
+marker means the boundary worked. Analyze in memory or through command output, and prefer tool options that
+avoid caches or temporary files. Network access and other processes are NOT isolated: never mutate live
+services, databases, or anything outside the candidate (no state-changing requests, resets, inserts, or
+pushes), because those effects cannot be rolled back. These mechanics protect the scored state without
+prescribing your method.`
     : `The harness checkpoints the candidate before your inspection and restores it afterwards, so any effects
 your commands have on the candidate's files are reverted. Experiment freely inside the candidate, but never
 mutate live services, databases, or anything outside it: those effects cannot be rolled back.`

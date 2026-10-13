@@ -25,7 +25,7 @@ import {
 import { verifierSystem, type VerifierMechanics } from '../roles/verifier.ts'
 import { converse } from './converse.ts'
 import { captureTree, moveAside, removeView, replayTree, shapeGate, stageReadOnlyView, verifyTree, type TreeCapture } from './fixtures.ts'
-import { formatLeads, inspect, learn, parseLeads, runHandoffPhase } from './steps.ts'
+import { formatLeads, inspect, leadsProblem, learn, parseLeads, runHandoffPhase } from './steps.ts'
 import {
   InfraError,
   TransportInfraError,
@@ -363,7 +363,7 @@ async function runProject(lineage: Lineage, project: WaveProject, options: Proje
         // The role's own outcome, not runtime trouble: the branch is not restarted.
         if (++failedRounds >= config.unverifiedRounds) throw new TransportInfraError(`${project.id}: ${failedRounds} UNVERIFIED rounds without a terminal verdict`)
         handoff = await runHandoffPhase(actor, `${unverifiedMessage(result.report)}\n\n${leadsRequest()}`, config.transport, {
-          validate: async body => (await shapeProblem(root)) ?? (parseLeads(body).length === 0 ? 'the handoff carries no CLAIM/PROBE evidence lead' : undefined),
+          validate: async body => (await shapeProblem(root)) ?? leadsProblem(body),
           ...(signal ? { signal } : {}),
         })
         leads = formatLeads(parseLeads(handoff))
@@ -585,7 +585,7 @@ async function runTargetAttempt(lineage: Lineage, cycle: number, target: string,
           // RSIAgent max_consec_done: repeated failed submissions stall the attempt.
           if (++failedRounds >= config.unverifiedRounds) throw new TransportInfraError(`${failedRounds} consecutive UNVERIFIED rounds`)
           handoff = await runHandoffPhase(actor, `${unverifiedMessage(result.report)}\n\n${leadsRequest()}`, config.transport, {
-            validate: async body => (await shapeProblem(root)) ?? (parseLeads(body).length === 0 ? 'the handoff carries no CLAIM/PROBE evidence lead' : undefined),
+            validate: async body => (await shapeProblem(root)) ?? leadsProblem(body),
             ...(signal ? { signal } : {}),
           })
           worklog.push(`HANDOFF:\n${handoff}`)

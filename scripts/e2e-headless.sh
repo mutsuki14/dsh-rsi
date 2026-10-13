@@ -62,9 +62,9 @@ else
   grep -q '"termination": "saturated"' "$EXPLORE_MEM/lineages/e2e-broad/result.json"
   grep -q '"kind":"practice","outcome":"FAIL"' "$EXPLORE_MEM/journal.jsonl"
   test -f "$EXPLORE_MEM/lineages/e2e-broad/wave-001/projects/greet/fixtures/tree/name.txt"
-  # Role project roots live outside the user's workspace (and its git repository).
-  test -d "$(ls -d "$DSH_HOME"/rsi-work/ws-explore-* | head -1)/lineages/e2e-broad"
-  test ! -e "$WORK/ws-explore/.dsh-rsi"
+  # Role project roots live in the workspace (writable under workspace-write) but ignore themselves.
+  test -d "$WORK/ws-explore/.dsh-rsi/work/lineages/e2e-broad"
+  test "$(cat "$WORK/ws-explore/.dsh-rsi/.gitignore")" = '*'
 fi
 
 echo "== roles seen by the mock model"

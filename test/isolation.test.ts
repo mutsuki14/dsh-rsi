@@ -145,3 +145,40 @@ describe('decideIsolation', () => {
   })
 })
 
+describe('host-side git and the user configuration', () => {
+  it('keeps system-scope settings such as safe.directory', async () => {
+    git(root, 'init', '-q')
+    await writeFile(join(root, 'a.txt'), 'x')
+    git(root, 'add', 'a.txt')
+    git(root, 'commit', '-qm', 'init')
+    await writeFile(join(root, 'a.txt'), 'changed')
+    const system = join(root, '..', `${root.split('/').at(-1)}-system.gitconfig`)
+    await writeFile(system, '[safe]\n\tdirectory = *\n')
+    execFileSync('chown', ['-R', '65534:65534', root])
+    const prior = process.env.GIT_CONFIG_SYSTEM
+    process.env.GIT_CONFIG_SYSTEM = system
+    try {
+      const state = await workspaceState(root)
+      expect(state.tracked).toBe(true)
+      expect(state.summary).toContain('M a.txt')
+    } finally {
+      if (prior === undefined) delete process.env.GIT_CONFIG_SYSTEM
+      else process.env.GIT_CONFIG_SYSTEM = prior
+      await rm(system, { force: true })
+    }
+  })
+})
+
+describe('WorkspaceCheckpoint and unreadable directories', () => {
+  it.skipIf(process.getuid?.() === 0)('never deletes files of a directory it could not read when the checkpoint was taken', async () => {
+    await mkdir(join(root, 'vol'))
+    await writeFile(join(root, 'vol', 'data'), 'user data')
+    await chmod(join(root, 'vol'), 0)
+    const checkpoint = await WorkspaceCheckpoint.take(root, [], limits)
+    await chmod(join(root, 'vol'), 0o755)
+    const changed = await checkpoint.restore()
+    await checkpoint.dispose()
+    expect(changed).toContain('vol/data')
+    expect(await readFile(join(root, 'vol', 'data'), 'utf8')).toBe('user data')
+  })
+})

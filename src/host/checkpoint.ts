@@ -22,6 +22,8 @@ export interface CheckpointLimits {
 
 type Method = 'git' | 'walk'
 
+const BIRTH_MARGIN_MS = 2_000
+
 const ABSENT = new Set(['ENOENT', 'ENOTDIR'])
 const UNREADABLE = new Set(['EACCES', 'EPERM', 'ELOOP'])
 
@@ -54,14 +56,18 @@ export class WorkspaceCheckpoint {
     readonly ignoredBefore: readonly string[],
     /** Copy of the checked files, or undefined in detect-only mode. */
     readonly store: string | undefined,
-    /** Paths that could not be read when the checkpoint was taken. */
+    /** Paths (directories end with `/`) that could not be read when the checkpoint was taken. */
     readonly unreadable: readonly string[],
+    /** When the checkpoint was taken: a file born before it was not created by the inspection. */
+    readonly takenAt: number,
   ) {}
 
   static async take(root: string, excludes: readonly string[], limits: CheckpointLimits): Promise<WorkspaceCheckpoint> {
+    const takenAt = Date.now()
     const listing = await listFiles(root, excludes, undefined)
     if (listing === undefined) throw new Error('the candidate files could not be listed')
-    const unreadable: string[] = []
+    // Directories nobody could read now hold files that pre-date the inspection; git skips them silently.
+    const unreadable: string[] = [...(listing.method === 'walk' ? listing.blocked : (await listFiles(root, excludes, 'walk'))!.blocked)]
     const stats = new Map<string, { size: number, mtimeMs: number, mode: number }>()
     let bytes = 0
     for (const rel of listing.files) {
@@ -102,7 +108,7 @@ export class WorkspaceCheckpoint {
       throw error
     }
     const ignoredBefore = listing.method === 'git' ? ((await gitLines(root, ['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory'], '\0')) ?? []) : []
-    return new WorkspaceCheckpoint(root, excludes, listing.method, entries, ignoredBefore, store, unreadable.sort())
+    return new WorkspaceCheckpoint(root, excludes, listing.method, entries, ignoredBefore, store, unreadable.sort(), takenAt)
   }
 
   get restores(): boolean {
@@ -110,8 +116,13 @@ export class WorkspaceCheckpoint {
   }
 
   /** Whether `rel` may have existed before the inspection although it was not checkpointed. */
-  #preexisting(rel: string): boolean {
-    return this.unreadable.includes(rel) || this.ignoredBefore.some(path => (path.endsWith('/') ? rel.startsWith(path) : rel === path))
+  async #preexisting(rel: string): Promise<boolean> {
+    const under = (paths: readonly string[]) => paths.some(path => (path.endsWith('/') ? rel.startsWith(path) : rel === path))
+    if (under(this.unreadable) || under(this.ignoredBefore)) return true
+    // Where the filesystem records birth times, a file born before the checkpoint is never the inspection's.
+    const info = await lstat(join(this.root, rel)).catch(() => undefined)
+    // Filesystem clocks are coarser than Date.now(): only a birth well before the checkpoint counts.
+    return info !== undefined && info.birthtimeMs > 0 && info.birthtimeMs < this.takenAt - BIRTH_MARGIN_MS
   }
 
   /**
@@ -182,7 +193,7 @@ export class WorkspaceCheckpoint {
       try {
         if (entry === undefined) {
           // Only what the inspection created goes; a pre-existing (ignored or unreadable) path stays.
-          if (created.has(rel) && !this.#preexisting(rel)) await rm(full, { recursive: true, force: true })
+          if (created.has(rel) && !(await this.#preexisting(rel))) await rm(full, { recursive: true, force: true })
           continue
         }
         await mkdir(dirname(full), { recursive: true })
@@ -208,21 +219,23 @@ export class WorkspaceCheckpoint {
  * or a `walk` that skips VCS and dependency directories. `undefined` when the
  * requested method fails, so a comparison never mixes the two.
  */
-async function listFiles(root: string, excludes: readonly string[], method: Method | undefined): Promise<{ method: Method, files: string[] } | undefined> {
+async function listFiles(root: string, excludes: readonly string[], method: Method | undefined): Promise<{ method: Method, files: string[], blocked: string[] } | undefined> {
   const excluded = (rel: string) => excludes.some(ex => rel === ex || rel.startsWith(`${ex}/`))
   if (method !== 'walk') {
     const tracked = await gitLines(root, ['ls-files', '-z', '--cached', '--others', '--exclude-standard'], '\0')
-    if (tracked !== undefined) return { method: 'git', files: [...new Set(tracked.filter(rel => rel !== '' && !excluded(rel)))] }
+    if (tracked !== undefined) return { method: 'git', files: [...new Set(tracked.filter(rel => rel !== '' && !excluded(rel)))], blocked: [] }
     if (method === 'git') return undefined
   }
   const files: string[] = []
+  const blocked: string[] = []
   const visit = async (dir: string): Promise<void> => {
     let entries
     try {
       entries = await readdir(dir, { withFileTypes: true })
     } catch (error) {
-      if (skippable(error)) return
-      throw error
+      if (!skippable(error)) throw error
+      if (!absent(error)) blocked.push(`${relative(root, dir).split(sep).join('/')}/`)
+      return
     }
     for (const entry of entries) {
       if (IGNORED.has(entry.name)) continue
@@ -234,5 +247,5 @@ async function listFiles(root: string, excludes: readonly string[], method: Meth
     }
   }
   await visit(root)
-  return { method: 'walk', files }
+  return { method: 'walk', files, blocked }
 }

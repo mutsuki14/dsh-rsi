@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto'
-import { appendFile, cp, lstat, mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { appendFile, cp, lstat, mkdir, open, readdir, readFile, rename, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { hostname } from 'node:os'
 import { dirname, join, relative, sep } from 'node:path'
 import type { LeakageAudit } from './audit.ts'
@@ -24,6 +24,8 @@ export type TerminalOutcome = 'PASS' | 'FAIL'
 
 export interface CommitRecord {
   episode: string
+  /** The verdict this experience came from (shared by a session and its forks); absent for engine episodes. */
+  origin?: string
   kind: EpisodeKind
   outcome: TerminalOutcome
   ts: string
@@ -34,6 +36,13 @@ export interface CommitRecord {
   created: string[]
   modified: string[]
   deleted: string[]
+}
+
+export interface CommitMeta {
+  kind: EpisodeKind
+  outcome: TerminalOutcome
+  /** The verdict this experience came from; a second promotion of the same origin returns the first. */
+  origin?: string
 }
 
 export interface MemoryDelta {
@@ -97,6 +106,17 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
+/** Whether a process recorded on this host has exited (never true for another host or an unknown process). */
+function processGone(owner: { pid: number, host: string } | undefined): boolean {
+  if (!owner || owner.host !== hostname() || owner.pid === process.pid) return false
+  try {
+    process.kill(owner.pid, 0)
+    return false
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ESRCH'
+  }
+}
+
 /** Walks a memory tree. Symlinks are refused so memory never aliases outside its root. */
 async function walk(root: string): Promise<Map<string, Buffer>> {
   const files = new Map<string, Buffer>()
@@ -148,7 +168,17 @@ interface DraftMeta {
   baseHash: string
   baseManifest: Manifest
   createdAt: string
+  /** Engine drafts record their process: a draft whose process is gone can never be resumed. */
+  process?: { pid: number, host: string }
 }
+
+/** Identifies this process's lock records, so a restarted process that reuses the pid never mistakes an old lock for its own. */
+const LOCK_NONCE = randomBytes(8).toString('hex')
+/** Lock tokens this process holds right now. */
+const HELD_LOCKS = new Set<string>()
+/** A lock whose heartbeat stopped this long ago has no live owner, whatever its pid or host. */
+const LOCK_LEASE_MS = 30_000
+const LOCK_HEARTBEAT_MS = 5_000
 
 function draftDirName(episode: string): string {
   return safeRelativePath(episode).replace(/\//g, '_')
@@ -198,10 +228,15 @@ export class MemoryStore {
     this.canonicalDir = join(root, 'memory')
   }
 
-  /** Creates the layout and recovers from an interrupted install, commit, or draft operation. */
-  async init(): Promise<void> {
+  /**
+   * Creates the layout and recovers from an interrupted install, commit, or
+   * draft operation. `prepare` (e.g. a one-time migration) runs first, inside
+   * the cross-process lock.
+   */
+  async init(prepare?: () => Promise<void>): Promise<void> {
     await mkdir(this.root, { recursive: true })
     await this.#serial(() => this.#locked(async () => {
+      if (prepare) await prepare()
       const entries = await readdir(this.root)
       const backups = entries.filter(name => name.startsWith('.backup-'))
       if (!(await exists(this.canonicalDir)) && backups.length > 0) {
@@ -227,7 +262,7 @@ export class MemoryStore {
         }
         if (!name.endsWith('.json')) continue
         const meta = await this.#readDraftMeta(join(draftsDir, name))
-        if (meta && !committed.has(meta.episode) && (await exists(join(draftsDir, draftDirName(meta.episode))))) {
+        if (meta && !committed.has(meta.episode) && !processGone(meta.process) && (await exists(join(draftsDir, draftDirName(meta.episode))))) {
           valid.add(draftDirName(meta.episode))
           continue
         }
@@ -293,53 +328,73 @@ export class MemoryStore {
   /**
    * Cross-process mutation lock (`O_EXCL` lock file). Two dsh processes in the
    * same project share one memory root; recovery and installs never interleave.
-   * A lock whose owner process on this host is gone is taken over.
+   * The holder refreshes the file's time while it works (a lease), so a lock
+   * left by a crash is taken over once its heartbeat stops — whatever pid or
+   * hostname the next process has — and at once when its owner on this host
+   * is known to be gone.
    */
   async #locked<T>(task: () => Promise<T>): Promise<T> {
     const path = join(this.root, '.lock')
     const deadline = Date.now() + (this.options.lockTimeoutMs ?? 60_000)
-    const owner = `${JSON.stringify({ pid: process.pid, host: hostname(), at: new Date().toISOString() })}\n`
-    for (;;) {
-      try {
-        const handle = await open(path, 'wx')
-        try {
-          await handle.writeFile(owner, 'utf8')
-        } finally {
-          await handle.close()
-        }
-        break
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
-        if (await this.#staleLock(path)) {
-          await rm(path, { force: true })
-          continue
-        }
-        if (Date.now() > deadline) throw new Error(`memory store ${this.root} is locked by another process`)
-        await new Promise(resolve => setTimeout(resolve, 50))
-      }
-    }
+    const token = `${LOCK_NONCE}:${randomBytes(6).toString('hex')}`
+    const owner = `${JSON.stringify({ pid: process.pid, host: hostname(), token, at: new Date().toISOString() })}\n`
+    HELD_LOCKS.add(token)
     try {
-      return await task()
+      for (;;) {
+        try {
+          const handle = await open(path, 'wx')
+          try {
+            await handle.writeFile(owner, 'utf8')
+          } finally {
+            await handle.close()
+          }
+          break
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+          const stale = await this.#staleLock(path)
+          if (stale !== undefined) {
+            // Take over only the exact record judged stale, never a lock someone else just took.
+            const now = await readFile(path, 'utf8').catch(() => undefined)
+            if (now === stale) await rm(path, { force: true })
+            continue
+          }
+          if (Date.now() > deadline) throw new Error(`memory store lock ${path} is held by another process; delete it if no dsh process uses this memory`)
+          await new Promise(resolve => setTimeout(resolve, 50))
+        }
+      }
+      const beat = setInterval(() => {
+        const now = new Date()
+        void utimes(path, now, now).catch(() => undefined)
+      }, LOCK_HEARTBEAT_MS)
+      beat.unref?.()
+      try {
+        return await task()
+      } finally {
+        clearInterval(beat)
+        await rm(path, { force: true })
+      }
     } finally {
-      await rm(path, { force: true })
+      HELD_LOCKS.delete(token)
     }
   }
 
-  async #staleLock(path: string): Promise<boolean> {
+  /** The stale lock's exact content, or `undefined` while a live owner may hold it. */
+  async #staleLock(path: string): Promise<string | undefined> {
+    const info = await stat(path).catch(() => undefined)
+    if (!info) return undefined
+    const content = await readFile(path, 'utf8').catch(() => undefined)
+    if (content === undefined) return undefined
+    if (Date.now() - info.mtimeMs > LOCK_LEASE_MS) return content
     try {
-      const owner = JSON.parse(await readFile(path, 'utf8')) as { pid?: number, host?: string }
-      if (owner.host !== hostname() || typeof owner.pid !== 'number') return false
-      if (owner.pid === process.pid) return false
-      try {
-        process.kill(owner.pid, 0)
-        return false
-      } catch (error) {
-        return (error as NodeJS.ErrnoException).code === 'ESRCH'
-      }
+      const owner = JSON.parse(content) as { pid?: number, host?: string, token?: string }
+      // A record of this process that it does not hold now was left by an earlier process with the same pid.
+      if (typeof owner.token === 'string' && owner.token.startsWith(`${LOCK_NONCE}:`)) return HELD_LOCKS.has(owner.token) ? undefined : content
+      if (owner.pid === process.pid && owner.host === hostname()) return typeof owner.token === 'string' ? content : undefined
+      if (owner.host !== hostname() || typeof owner.pid !== 'number') return undefined
+      return processGone({ pid: owner.pid, host: owner.host }) ? content : undefined
     } catch {
       // A lock file still being written, or torn by a crash: torn locks older than a few seconds are stale.
-      const info = await stat(path).catch(() => undefined)
-      return info !== undefined && Date.now() - info.mtimeMs > 5_000
+      return Date.now() - info.mtimeMs > 5_000 ? content : undefined
     }
   }
 
@@ -457,7 +512,14 @@ export class MemoryStore {
       await cp(this.canonicalDir, dir, { recursive: true })
       const baseManifest = manifestOf(await walk(dir))
       const draft = new MemoryDraft(episode, dir, manifestHash(baseManifest), baseManifest)
-      const meta: DraftMeta = { v: 1, episode, baseHash: draft.baseHash, baseManifest, createdAt: new Date().toISOString() }
+      const meta: DraftMeta = {
+        v: 1,
+        episode,
+        baseHash: draft.baseHash,
+        baseManifest,
+        createdAt: new Date().toISOString(),
+        ...(options.fresh ? { process: { pid: process.pid, host: hostname() } } : {}),
+      }
       await writeFile(`${metaPath}.tmp`, `${JSON.stringify(meta)}\n`)
       await rename(`${metaPath}.tmp`, metaPath)
       this.#drafts.set(episode, draft)
@@ -498,11 +560,16 @@ export class MemoryStore {
     const bytes = Buffer.byteLength(content, 'utf8')
     if (bytes > this.limits.maxFileBytes) throw new MemoryLimitError(`memory file ${rel} is ${bytes} bytes; the limit is ${this.limits.maxFileBytes}`)
     // Aggregate limits apply while the Actor writes, so it can trim within its own learning turn.
+    // Only growth is refused here: condensing an over-limit draft must stay possible; commit checks the result.
     const usage = await this.#usage(draft.dir)
-    const files = usage.size + (usage.has(rel) ? 0 : 1)
-    const total = [...usage.values()].reduce((sum, size) => sum + size, 0) - (usage.get(rel) ?? 0) + bytes
-    if (files > this.limits.maxFiles) throw new MemoryLimitError(`memory would hold ${files} files; the limit is ${this.limits.maxFiles}. Merge or delete files first.`)
-    if (total > this.limits.maxTotalBytes) throw new MemoryLimitError(`memory would hold ${total} bytes; the limit is ${this.limits.maxTotalBytes}. Condense or delete files first.`)
+    const previous = usage.get(rel)
+    const total = [...usage.values()].reduce((sum, size) => sum + size, 0) - (previous ?? 0) + bytes
+    if (previous === undefined && usage.size + 1 > this.limits.maxFiles) {
+      throw new MemoryLimitError(`memory would hold ${usage.size + 1} files; the limit is ${this.limits.maxFiles}. Merge or delete files first.`)
+    }
+    if (total > this.limits.maxTotalBytes && bytes > (previous ?? 0)) {
+      throw new MemoryLimitError(`memory would hold ${total} bytes; the limit is ${this.limits.maxTotalBytes}. Condense or delete files first.`)
+    }
     const full = join(draft.dir, rel)
     await mkdir(dirname(full), { recursive: true })
     await writeFile(full, content, 'utf8')
@@ -540,8 +607,9 @@ export class MemoryStore {
     }
   }
 
+  /** The commit of `episode`, or of any episode that came from it as its origin verdict. */
   async findCommit(episode: string): Promise<CommitRecord | undefined> {
-    return (await this.journal()).find(record => record.episode === episode)
+    return (await this.journal()).find(record => record.episode === episode || record.origin === episode)
   }
 
   async draftManifest(draft: MemoryDraft): Promise<Manifest> {
@@ -573,14 +641,15 @@ export class MemoryStore {
    * processes; a draft whose base is no longer canonical is refused rather than
    * silently overwriting a sibling commit.
    */
-  commit(draft: MemoryDraft, meta: { kind: EpisodeKind, outcome: TerminalOutcome }): Promise<CommitRecord> {
+  commit(draft: MemoryDraft, meta: CommitMeta): Promise<CommitRecord> {
     return this.#serial(() => this.#locked(() => this.#commit(draft, meta)))
   }
 
-  async #commit(draft: MemoryDraft, meta: { kind: EpisodeKind, outcome: TerminalOutcome }): Promise<CommitRecord> {
+  async #commit(draft: MemoryDraft, meta: CommitMeta): Promise<CommitRecord> {
     if (await this.frozen()) throw new MemoryFrozenError()
     await this.#resolvePending()
-    const already = await this.findCommit(draft.episode)
+    // The same experience is promoted once: by episode, and by the verdict it came from (a session and its forks).
+    const already = (await this.journal()).find(record => record.episode === draft.episode || (meta.origin !== undefined && (record.origin === meta.origin || record.episode === meta.origin)))
     if (already) {
       await this.#discard(draft.episode)
       return already
@@ -601,7 +670,9 @@ export class MemoryStore {
       if (this.options.audit.flagged(text).length > 0) {
         // Durable before the draft goes: no second learning phase for a quarantined episode, even after a crash.
         await mkdir(join(this.root, 'quarantined'), { recursive: true })
-        await writeFile(join(this.root, 'quarantined', draftDirName(draft.episode)), `${new Date().toISOString()}\n`)
+        for (const id of meta.origin === undefined ? [draft.episode] : [draft.episode, meta.origin]) {
+          await writeFile(join(this.root, 'quarantined', draftDirName(id)), `${new Date().toISOString()}\n`)
+        }
         await this.#discard(draft.episode)
         throw new MemoryQuarantineError()
       }
@@ -609,6 +680,7 @@ export class MemoryStore {
 
     const record: CommitRecord = {
       episode: draft.episode,
+      ...(meta.origin === undefined ? {} : { origin: meta.origin }),
       kind: meta.kind,
       outcome: meta.outcome,
       ts: new Date().toISOString(),

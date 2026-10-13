@@ -1,3 +1,4 @@
+import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { cp, lstat, mkdir, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
@@ -22,9 +23,10 @@ export function dshHome(): string {
  *   records) lives outside the project by default, like RSIAgent's host-side
  *   memory, so candidates, diffs, and Verifier file tools never contain it.
  * - The work root holds only what roles must work in: practice and target
- *   project roots and fixture authoring roots. It also lives outside the
- *   project by default, so role commands such as `git` never act on the
- *   user's repository.
+ *   project roots and fixture authoring roots. It stays inside the project,
+ *   the only place dsh's default workspace-write sandbox lets role agents
+ *   write, but is its own git boundary and ignores itself, so role commands
+ *   such as `git` never act on the user's repository.
  */
 export class StoreRegistry {
   readonly #stores = new Map<string, Promise<MemoryStore>>()
@@ -43,7 +45,7 @@ export class StoreRegistry {
   stateRoot(projectDir: string): string {
     const configured = this.config.stateDir.trim()
     if (configured) return isAbsolute(configured) ? configured : resolve(projectDir, configured)
-    return join(dshHome(), 'rsi-work', projectKey(projectDir))
+    return resolve(projectDir, '.dsh-rsi', 'work')
   }
 
   /** Harness-private memory root. */
@@ -59,6 +61,7 @@ export class StoreRegistry {
     return this.forRoot(root, this.config.memoryDir.trim() === '' ? () => migrateLegacyMemory(resolve(projectDir, '.dsh-rsi'), root) : undefined)
   }
 
+  /** Opens a store; `prepare` runs inside its cross-process lock, before recovery. */
   forRoot(root: string, prepare?: () => Promise<void>): Promise<MemoryStore> {
     let store = this.#stores.get(root)
     if (!store) {
@@ -67,7 +70,7 @@ export class StoreRegistry {
         audit: this.#audit,
         frozen: this.config.mode === 'frozen',
       })
-      store = (prepare ? prepare() : Promise.resolve()).then(() => created.init()).then(async () => {
+      store = created.init(prepare).then(async () => {
         await this.refresh(created)
         return created
       })
@@ -97,6 +100,23 @@ export function projectKey(projectDir: string): string {
 
 const LEGACY_ENTRIES = ['memory', 'journal.jsonl', 'history', 'frozen.json', 'reports']
 
+/**
+ * Makes a work root inside the user's project inert for git: it ignores
+ * itself (so the user's status stays clean) and is its own repository (so a
+ * role's git command never discovers the user's). Host-side, no hooks run.
+ */
+export async function prepareWorkRoot(workRoot: string): Promise<void> {
+  await mkdir(workRoot, { recursive: true })
+  const parent = resolve(workRoot, '..')
+  if (basename(parent) === '.dsh-rsi') await writeFile(join(parent, '.gitignore'), '*\n', { flag: 'wx' }).catch(() => undefined)
+  await writeFile(join(workRoot, '.gitignore'), '*\n', { flag: 'wx' }).catch(() => undefined)
+  if (!(await exists(join(workRoot, '.git')))) {
+    await new Promise<void>(done => {
+      execFile('git', ['-c', 'core.hooksPath=/dev/null', 'init', '-q', workRoot], { timeout: 15_000 }, () => done())
+    })
+  }
+}
+
 async function exists(path: string): Promise<boolean> {
   return lstat(path).then(() => true, () => false)
 }
@@ -119,7 +139,8 @@ export async function migrateLegacyMemory(legacy: string, root: string): Promise
     await rm(to, { recursive: true, force: true })
     try {
       await rename(from, to)
-    } catch {
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
       // Different filesystems: copy, then remove the workspace copy.
       await cp(from, to, { recursive: true, verbatimSymlinks: true })
       await rm(from, { recursive: true, force: true })

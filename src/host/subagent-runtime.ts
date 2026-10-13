@@ -110,7 +110,7 @@ export class SubagentConversation implements RoleConversation {
 
   async send(message: string, signal?: AbortSignal): Promise<RoleReply> {
     if (this.#closed) throw new InfraError(`${this.role.label}: the role context is closed`)
-    signal?.throwIfAborted()
+    if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error('the role context was cancelled')
     if (this.#child === undefined) await this.#start(message)
     else if (!this.#channel.respond(message)) {
       // RSIAgent never continues in a lossy copy: a context that ended is infrastructure.

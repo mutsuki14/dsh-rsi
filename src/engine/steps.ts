@@ -23,14 +23,20 @@ export interface Lead {
   probe: string
 }
 
-/**
- * Extracts CLAIM/PROBE pairs. A probe is the rest of its PROBE: line, or — when
- * that is empty — the fenced code block right after it. Every other line
- * (narrative before, between, or after the pairs) is dropped, so only the
- * pairs reach the Verifier.
- */
-export function parseLeads(handoff: string): Lead[] {
+const FENCE_OPENER = /^\s*(`{3,}|~{3,})[^\s`~]*\s*$/
+const INLINE_FENCE = /^(`{3,}|~{3,})(.+?)\1\s*$/
+const PAIR_LINE = /^\s*(CLAIM|PROBE):/
+/** A shell line that continues onto the next one: an open heredoc (not `<<<`) or a trailing backslash. */
+const CONTINUES = /(?:(?<!<)<<-?\s*['"]?[A-Za-z_]\w*['"]?\s*$)|\\$/
+
+interface LeadScan {
+  leads: Lead[]
+  problems: string[]
+}
+
+function scanLeads(handoff: string): LeadScan {
   const leads: Lead[] = []
+  const problems: string[] = []
   const lines = handoff.split(/\r?\n/)
   let claim: string | undefined
   for (let index = 0; index < lines.length; index++) {
@@ -42,24 +48,64 @@ export function parseLeads(handoff: string): Lead[] {
     }
     const probeMatch = /^\s*PROBE:\s*(.*)$/.exec(line)
     if (!probeMatch || claim === undefined) continue
+    const number = leads.length + problems.length + 1
     let probe = probeMatch[1]!.trim()
-    if (probe === '' || /^(`{3,}|~{3,})/.test(probe)) {
+    const inline = INLINE_FENCE.exec(probe)
+    if (inline) probe = inline[2]!.trim()
+    else if (probe === '' || FENCE_OPENER.test(probe)) {
       // A multi-line probe: the fenced block opening on this line or the next non-empty one.
-      let open = probe === '' ? index + 1 : index
-      while (probe === '' && open < lines.length && lines[open]!.trim() === '') open++
-      const fence = /^\s*(`{3,}|~{3,})/.exec(probe === '' ? lines[open] ?? '' : probe)
-      if (!fence) continue
+      let open = index
+      if (probe === '') {
+        open = index + 1
+        while (open < lines.length && lines[open]!.trim() === '') open++
+      }
+      const fence = FENCE_OPENER.exec(probe === '' ? lines[open] ?? '' : probe)
+      if (!fence) {
+        problems.push(`PROBE ${number} is empty; put a multi-line probe in a fenced code block right after the PROBE: line`)
+        claim = undefined
+        continue
+      }
       const body: string[] = []
       let end = open + 1
-      while (end < lines.length && !lines[end]!.trim().startsWith(fence[1]!)) body.push(lines[end++]!)
-      if (end >= lines.length) continue
+      while (end < lines.length && !lines[end]!.trim().startsWith(fence[1]!) && !PAIR_LINE.test(lines[end]!)) body.push(lines[end++]!)
+      if (end >= lines.length || !lines[end]!.trim().startsWith(fence[1]!)) {
+        // Never swallow the text or pairs after an unterminated fence.
+        problems.push(`the fenced block of PROBE ${number} is never closed`)
+        claim = undefined
+        continue
+      }
       probe = body.join('\n').trim()
       index = end
+    } else {
+      let next = index + 1
+      while (next < lines.length && lines[next]!.trim() === '') next++
+      if (CONTINUES.test(probe) || FENCE_OPENER.test(lines[next] ?? '')) {
+        problems.push(`PROBE ${number} continues onto later lines; a multi-line probe goes in a fenced code block right after an empty PROBE: line`)
+        claim = undefined
+        continue
+      }
     }
     if (probe !== '') leads.push({ claim, probe })
     claim = undefined
   }
-  return leads
+  return { leads, problems }
+}
+
+/**
+ * Extracts CLAIM/PROBE pairs. A probe is the rest of its PROBE: line (or the
+ * text of an inline fence there), or — when that is empty or opens a fence —
+ * the fenced code block that follows. Every other line (narrative before,
+ * between, or after the pairs) is dropped, so only the pairs reach the Verifier.
+ */
+export function parseLeads(handoff: string): Lead[] {
+  return scanLeads(handoff).leads
+}
+
+/** Why a leads handoff cannot be forwarded intact, or `undefined` when every pair is well formed and one exists. */
+export function leadsProblem(handoff: string): string | undefined {
+  const { leads, problems } = scanLeads(handoff)
+  if (problems.length > 0) return problems.join('; ')
+  return leads.length === 0 ? 'the handoff carries no CLAIM/PROBE evidence lead' : undefined
 }
 
 /** RSIAgent's LEAD blocks (loop.py:459-464); the harness does not execute probes, so each is NOT_RUN. */
