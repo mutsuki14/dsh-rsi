@@ -36,7 +36,7 @@ import {
   type RoleRuntime,
   type TransportPolicy,
 } from './types.ts'
-import { describeDelta, discardableCopy, projectManifest } from './workspace.ts'
+import { describeDelta, discardableCopy, projectManifest, treeFingerprint } from './workspace.ts'
 
 export interface EngineConfig {
   /** Phase 1: host capacity ceiling for one wave; never disclosed unless exceeded. */
@@ -120,8 +120,12 @@ export interface DeepResult extends SealedInvariants {
   practiceProjects: number
   verdict: Verdict
   report: string
-  /** Project root of the final target attempt: the candidate a sealed evaluation measures. */
+  /** Project root of the final target attempt. */
   candidateRoot: string
+  /** Harness-private copy of that candidate as the lineage ended: what a sealed evaluation measures. */
+  candidateCopy: string
+  /** `treeFingerprint` of the candidate at the end of the lineage. */
+  candidateDigest: string
   memoryHash: string
 }
 
@@ -165,9 +169,11 @@ class Lineage {
     await writeFile(join(this.priv, 'result.json'), `${JSON.stringify(result, null, 2)}\n`)
   }
 
-  /** Infrastructure and quarantine end the lineage unscored, with an explicit record. */
+  /** Infrastructure, quarantine, and cancellation end the lineage unscored, with an explicit record. */
   async fail(error: unknown): Promise<never> {
-    const termination = error instanceof MemoryQuarantineError ? 'quarantined' : error instanceof InfraError ? 'infra' : 'error'
+    const termination = this.deps.signal?.aborted
+      ? 'aborted'
+      : error instanceof MemoryQuarantineError ? 'quarantined' : error instanceof InfraError ? 'infra' : 'error'
     await this.event('LINEAGE_ABORTED', { termination, reason: String(error) })
     await this.finish({ lineage: this.id, termination, reason: String(error), memoryHash: await this.deps.store.treeHash(), ...SEALED })
     throw error
@@ -217,10 +223,9 @@ function outcomeText(index: string, outcome: ProjectOutcome): string {
   ].join('\n\n')
 }
 
-function memoryChanges(commit: CommitRecord | undefined): string {
-  const changes = commit
-    ? { created: commit.created, deleted: commit.deleted, modified: commit.modified, unchanged: commit.created.length + commit.deleted.length + commit.modified.length === 0 }
-    : { created: [], deleted: [], modified: [], unchanged: true }
+/** RSIAgent `_memory_changes`: sorted created, deleted, modified, and unchanged file names. */
+function memoryChanges(commit: CommitRecord, unchanged: readonly string[]): string {
+  const changes = { created: commit.created, deleted: commit.deleted, modified: commit.modified, unchanged: [...unchanged].sort() }
   return `MEMORY CHANGES:\n${JSON.stringify(changes, null, 2)}`
 }
 
@@ -263,10 +268,24 @@ async function shapeProblem(root: string): Promise<string | undefined> {
 async function protectedInspection(
   lineage: Lineage,
   verifier: RoleConversation,
-  input: { root: string, checkpointDir: string, task: string, generation: number, before: Awaited<ReturnType<typeof projectManifest>>, leads?: string, allowUnverified: boolean, originalFixtures?: string, label: string },
+  input: {
+    root: string
+    checkpointDir: string
+    task: string
+    generation: number
+    before: Awaited<ReturnType<typeof projectManifest>>
+    leads?: string
+    allowUnverified: boolean
+    originalFixtures?: string
+    label: string
+    /** A fresh Verifier on another model taking over, with the earlier context's published reports. */
+    handover?: { priorReports: readonly string[] }
+  },
 ) {
   const { config, signal } = lineage.deps
   const after = await projectManifest(input.root)
+  // The integrity check covers the whole tree (.git, dependency trees, caches), not the summary's view of it.
+  const fingerprint = await treeFingerprint(input.root)
   await rm(input.checkpointDir, { recursive: true, force: true })
   await discardableCopy(input.root, input.checkpointDir)
   try {
@@ -276,11 +295,12 @@ async function protectedInspection(
       mechanicalContext: describeDelta(input.root, input.before, after),
       ...(input.leads ? { leads: input.leads } : {}),
       ...(input.originalFixtures ? { originalFixtures: input.originalFixtures } : {}),
+      ...(input.handover ? { handover: 'other-verifier' as const, priorReports: input.handover.priorReports } : {}),
       allowUnverified: input.allowUnverified,
       policy: config.transport,
       ...(signal ? { signal } : {}),
     })
-    if (JSON.stringify(await projectManifest(input.root)) !== JSON.stringify(after)) {
+    if ((await treeFingerprint(input.root)) !== fingerprint) {
       // Verifier effects never reach the candidate: restore the captured checkpoint.
       await rm(input.root, { recursive: true, force: true })
       await cp(input.checkpointDir, input.root, { recursive: true, preserveTimestamps: true, verbatimSymlinks: true })
@@ -340,7 +360,8 @@ async function runProject(lineage: Lineage, project: WaveProject, options: Proje
         if (result.verdict !== 'UNVERIFIED') {
           return { project, verdict: result.verdict, reports, actor, binding }
         }
-        if (++failedRounds >= config.unverifiedRounds) throw new InfraError(`${project.id}: ${failedRounds} UNVERIFIED rounds without a terminal verdict`)
+        // The role's own outcome, not runtime trouble: the branch is not restarted.
+        if (++failedRounds >= config.unverifiedRounds) throw new TransportInfraError(`${project.id}: ${failedRounds} UNVERIFIED rounds without a terminal verdict`)
         handoff = await runHandoffPhase(actor, `${unverifiedMessage(result.report)}\n\n${leadsRequest()}`, config.transport, {
           validate: async body => (await shapeProblem(root)) ?? (parseLeads(body).length === 0 ? 'the handoff carries no CLAIM/PROBE evidence lead' : undefined),
           ...(signal ? { signal } : {}),
@@ -373,7 +394,8 @@ async function runProjectWithRetry(lineage: Lineage, project: WaveProject, optio
 /** Captures each declared wave fixture tree and removes the authoring copies, so branches never share a mutable tree. */
 async function captureWave(lineage: Lineage, waveRoot: string, privWave: string, projects: readonly WaveProject[]): Promise<Map<string, TreeCapture>> {
   const captures = new Map<string, TreeCapture>()
-  for (const project of projects) captures.set(project.id, await captureTree(join(waveRoot, project.id), join(privWave, project.id, 'fixtures')))
+  // Under projects/, so no project id can collide with the wave's memory snapshot.
+  for (const project of projects) captures.set(project.id, await captureTree(join(waveRoot, project.id), join(privWave, 'projects', project.id, 'fixtures')))
   await rm(waveRoot, { recursive: true, force: true })
   await lineage.event('WAVE_FIXTURES_CAPTURED', { projects: projects.map(project => project.id) })
   return captures
@@ -454,26 +476,31 @@ export async function runBroadExploration(deps: EngineDeps, input: { lineage: st
 
       const verified = settled.map(result => (result as PromiseFulfilledResult<VerifiedProject>).value)
       const rendered: string[] = []
-      for (const [index, branch] of verified.entries()) {
-        try {
-          const learning = await learn(branch.actor, {
-            store,
-            binding: branch.binding,
-            episode: `${input.lineage}-w${wave}-${branch.project.id}`,
-            kind: 'practice',
-            outcome: branch.verdict,
-            report: branch.reports.at(-1)!,
-            diagnosis: false,
-            policy: config.transport,
-            ...(signal ? { signal } : {}),
-          })
-          const outcome: ProjectOutcome = { id: branch.project.id, instruction: branch.project.instruction, verdict: branch.verdict, reports: branch.reports, commit: learning.commit }
-          projects.push(outcome)
-          rendered.push(`${outcomeText(`${wave}.${index + 1} (${branch.project.id})`, outcome)}\n\n${memoryChanges(learning.commit)}`)
-          await lineage.event('MEMORY_COMMITTED', { wave, project: branch.project.id, tree: learning.commit.treeAfter })
-        } finally {
-          await branch.actor.close()
+      try {
+        for (const [index, branch] of verified.entries()) {
+          try {
+            const learning = await learn(branch.actor, {
+              store,
+              binding: branch.binding,
+              episode: `${input.lineage}-w${wave}-${branch.project.id}`,
+              kind: 'practice',
+              outcome: branch.verdict,
+              report: branch.reports.at(-1)!,
+              diagnosis: false,
+              policy: config.transport,
+              ...(signal ? { signal } : {}),
+            })
+            const outcome: ProjectOutcome = { id: branch.project.id, instruction: branch.project.instruction, verdict: branch.verdict, reports: branch.reports, commit: learning.commit }
+            projects.push(outcome)
+            rendered.push(`${outcomeText(`${wave}.${index + 1} (${branch.project.id})`, outcome)}\n\n${memoryChanges(learning.commit, learning.unchanged)}`)
+            await lineage.event('MEMORY_COMMITTED', { wave, project: branch.project.id, tree: learning.commit.treeAfter })
+          } finally {
+            await branch.actor.close()
+          }
         }
+      } finally {
+        // Whatever ended the serial learning, no later branch's Actor context outlives it.
+        for (const branch of verified) await branch.actor.close()
       }
       priorWave = `WAVE ${wave} CURRICULUM RATIONALE:\n${decision.rationale}\n\n${rendered.join('\n\n---\n\n')}`
       await lineage.event('WAVE_COMPLETED', { wave, projects: verified.length })
@@ -514,16 +541,26 @@ async function runTargetAttempt(lineage: Lineage, cycle: number, target: string,
   let actor = await lineage.open('actor', `target#${cycle} actor`, engineActorSystem(), root, binding)
   let verifier = await lineage.open('verifier', `target#${cycle} verifier`, verifierSystem(true, config.verifierMechanics), root, { access: 'none' })
   let generation = 0
-  const inspectNow = (leads?: string) => protectedInspection(lineage, verifier, {
-    root,
-    checkpointDir: join(cycleDir, 'candidate.checkpoint'),
-    task: instruction,
-    generation: ++generation,
-    before,
-    ...(leads ? { leads } : {}),
-    allowUnverified: true,
-    label: `target#${cycle}`,
-  })
+  let swapped = false
+  /** Reports of this attempt's Verifier so far; a swapped-in Verifier gets them once, on its first inspection. */
+  const reports: string[] = []
+  let handover: { priorReports: readonly string[] } | undefined
+  const inspectNow = async (leads?: string) => {
+    const result = await protectedInspection(lineage, verifier, {
+      root,
+      checkpointDir: join(cycleDir, 'candidate.checkpoint'),
+      task: instruction,
+      generation: ++generation,
+      before,
+      ...(leads ? { leads } : {}),
+      allowUnverified: true,
+      label: `target#${cycle}`,
+      ...(handover ? { handover } : {}),
+    })
+    handover = undefined
+    if (result.kind === 'verdict') reports.push(result.report)
+    return result
+  }
   try {
     await lineage.event('TARGET_STARTED', { targetCycle: cycle })
     let opening = targetActorCharter(target, root, await store.inventory(), config.inventoryListed)
@@ -571,10 +608,13 @@ async function runTargetAttempt(lineage: Lineage, cycle: number, target: string,
           const escalated = config.escalation
           binding = readBinding(store.canonicalDir)
           actor = await lineage.open('actor', `target#${cycle} actor (resume ${resumes})`, engineActorSystem(), root, binding, escalated ? 'escalation' : 'actor')
-          if (escalated && config.crossModelVerifier) {
-            // Two different models must still agree: the resumed segment's Verifier takes the original Actor route.
+          if (escalated && config.crossModelVerifier && !swapped) {
+            // Two different models must still agree: the resumed segment's Verifier takes the original Actor route,
+            // once; later resumes keep that context.
+            swapped = true
             await verifier.close()
-            verifier = await lineage.open('verifier', `target#${cycle} verifier (resume ${resumes})`, verifierSystem(true, config.verifierMechanics), root, { access: 'none' }, 'actor')
+            verifier = await lineage.open('verifier', `target#${cycle} verifier (cross-model)`, verifierSystem(true, config.verifierMechanics), root, { access: 'none' }, 'actor')
+            handover = { priorReports: [...reports] }
           }
           const log = worklog.join('\n\n')
           opening = targetActorCharter(target, root, await store.inventory(), config.inventoryListed, changed ? resumeHandoffMessage(log) : resumePivotMessage(log))
@@ -624,6 +664,10 @@ export async function runDeepExploration(
   let finalAfterBudget = false
   const history: string[] = []
   const finish = async (termination: DeepResult['termination'], outcome: TargetOutcome): Promise<DeepResult> => {
+    // The candidate as the lineage ended, kept privately: later edits to the work root never change what is measured.
+    const candidateCopy = join(lineage.priv, 'final-candidate')
+    await rm(candidateCopy, { recursive: true, force: true })
+    await discardableCopy(outcome.root, candidateCopy)
     const result: DeepResult = {
       lineage: input.lineage,
       termination,
@@ -632,6 +676,8 @@ export async function runDeepExploration(
       verdict: outcome.verdict,
       report: outcome.report,
       candidateRoot: outcome.root,
+      candidateCopy,
+      candidateDigest: await treeFingerprint(candidateCopy),
       memoryHash: await store.treeHash(),
       ...SEALED,
     }

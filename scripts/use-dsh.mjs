@@ -2,7 +2,8 @@
 // Rewrites devDependencies to one supported dsh release line for the CI matrix:
 //   node scripts/use-dsh.mjs 0.2.0-rc.2   (what `npx @deepseek-ai/dsh` installs)
 //   node scripts/use-dsh.mjs 0.2.1-alpha.2
-// Then run `pnpm install --no-frozen-lockfile`. The committed lockfile stays on the alpha line.
+// Then remove pnpm-lock.yaml and run `pnpm install --no-frozen-lockfile`, so no alpha package from the
+// committed lockfile (which stays on the alpha line) leaks into the rc graph.
 import { readFileSync, writeFileSync } from 'node:fs'
 
 const version = process.argv[2]

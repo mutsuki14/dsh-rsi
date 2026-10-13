@@ -117,7 +117,7 @@ describe('runBroadExploration', () => {
     expect(result.projects.map(project => [project.id, project.verdict])).toEqual([['alpha', 'PASS'], ['beta', 'FAIL']])
     expect((await store.journal()).map(record => record.episode)).toEqual(['l1-w1-alpha', 'l1-w1-beta'])
     // Captured fixtures stay private; the authoring tree is gone so branches never share a mutable copy.
-    expect(await readdir(join(paths(lineage).private, 'wave-001', 'beta', 'fixtures', 'tree', 'refs'))).toEqual(['spec.md'])
+    expect(await readdir(join(paths(lineage).private, 'wave-001', 'projects', 'beta', 'fixtures', 'tree', 'refs'))).toEqual(['spec.md'])
     expect(await readdir(join(paths(lineage).workspace, 'wave-001'))).toEqual(['alpha', 'beta'])
     expect(runtime.opened.find(options => options.role === 'curriculum')?.notesFile).toBe(join(paths(lineage).private, 'curriculum_notes.md'))
     expect(runtime.closed).toBe(runtime.opened.length)
@@ -331,7 +331,13 @@ describe('runDeepExploration', () => {
         }
         return message.includes('LEARNING DIAGNOSIS') ? 'diag' : 'ok'
       },
-      verifier: (_message, options) => (options.label.includes('resume') ? 'VERDICT: PASS' : 'still unclear\nVERDICT: UNVERIFIED'),
+      verifier: (message, options) => {
+        if (options.route !== 'actor') return 'still unclear\nVERDICT: UNVERIFIED'
+        // The swapped-in Verifier is told it takes over, and sees the earlier context's reports.
+        expect(message).toContain('You are a fresh Verifier context on a different model')
+        expect(message).toContain('PUBLISHED REPORTS OF THE EARLIER VERIFIER CONTEXT')
+        return 'VERDICT: PASS'
+      },
     })
     const original = runtime.open.bind(runtime)
     runtime.open = async options => {
@@ -384,5 +390,71 @@ describe('runDeepExploration', () => {
     })
     const result = await runDeepExploration(deps(runtime, { stopPolicy: 'verifier_pass' }), { lineage: 'd6', target: 'In <PROJECT_ROOT> do it.', paths: paths('d6'), targetFixtures })
     expect(result.termination).toBe('verifier_pass')
+  })
+})
+
+describe('engine learning', () => {
+  it('sends an over-limit draft back to the same Actor to trim instead of aborting the lineage', async () => {
+    const small = new MemoryStore(join(base, 'small'), { maxFileBytes: 4096, maxTotalBytes: 65536, maxFiles: 2 }, { keepHistory: false })
+    await small.init()
+    let trimmed = false
+    const runtime = new FakeRuntime({
+      curriculum: async (message, _options, turn) => {
+        if (turn === 0) {
+          await fixture(join(waveRootOf(message), 'one'), { 'input.txt': 'x' })
+          return wave(['one'])
+        }
+        return '{"decision":"SATURATED","rationale":"done","projects":[]}'
+      },
+      actor: async (message, options, turn) => {
+        if (turn === 0) {
+          await writeFile(join(options.cwd, 'one.out'), 'one')
+          return 'STATUS: SUBMIT'
+        }
+        if (message.includes('MEMORY DISTILLATION')) {
+          expect(message).toContain('the store\'s only limits are 2 files')
+          await writeMemory(small, options, 'a.md', 'a')
+          await writeMemory(small, options, 'b.md', 'b')
+          // A file that slipped past the tools (e.g. written by a script) pushes the draft over the limit.
+          await writeFile(join(options.memory.draft!.dir, 'c.md'), 'c')
+          return 'draft ready'
+        }
+        if (message.includes('cannot be promoted')) {
+          expect(options.memory.access).toBe('draft')
+          await rm(join(options.memory.draft!.dir, 'c.md'))
+          trimmed = true
+          return 'trimmed'
+        }
+        return 'reconciled'
+      },
+      verifier: () => 'VERDICT: PASS',
+    })
+    const result = await runBroadExploration({ runtime, store: small, config, observe: event => events.push(event) }, { lineage: 'lim', direction: 'x', paths: paths('lim') })
+    expect(result.termination).toBe('saturated')
+    expect(trimmed).toBe(true)
+    expect((await small.inventory()).map(entry => entry.path)).toEqual(['a.md', 'b.md'])
+  })
+
+  it('closes every branch Actor when serial wave learning fails', async () => {
+    const runtime = new FakeRuntime({
+      curriculum: async message => {
+        await fixture(join(waveRootOf(message), 'first'), { 'input.txt': 'x' })
+        await fixture(join(waveRootOf(message), 'second'), { 'input.txt': 'y' })
+        return wave(['first', 'second'])
+      },
+      actor: async (message, options, turn) => {
+        if (turn === 0) {
+          await writeFile(join(options.cwd, 'out'), 'o')
+          return 'STATUS: SUBMIT'
+        }
+        if (message.includes('MEMORY DISTILLATION') && options.label.includes('first')) throw new InfraError('the first Actor context died while distilling')
+        return 'ok'
+      },
+      verifier: () => 'VERDICT: PASS',
+    })
+    await expect(runBroadExploration(deps(runtime), { lineage: 'leak', direction: 'x', paths: paths('leak') })).rejects.toThrow(/died while distilling/)
+    // The second branch never learned, yet its Actor context is closed too: nothing stays parked.
+    expect(runtime.closed).toBe(runtime.opened.length)
+    expect(JSON.parse(await readFile(join(paths('leak').private, 'result.json'), 'utf8'))).toMatchObject({ termination: 'infra' })
   })
 })

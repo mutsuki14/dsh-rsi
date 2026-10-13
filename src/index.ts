@@ -35,18 +35,20 @@ import {
   memoryPreamble,
   reconciliationMessage,
   stallContinuation,
+  toolStepContinuation,
+  truncatedContinuation,
   unverifiedMessage,
 } from './roles/actor.ts'
 import { verifierSystem } from './roles/verifier.ts'
 import { CLOSED } from './host/channel.ts'
 import { WorkspaceCheckpoint } from './host/checkpoint.ts'
 import { workspaceState } from './host/git.ts'
-import { applyRoleIsolation, decideIsolation, type IsolationDecision } from './host/isolation.ts'
-import { RoleRegistry, type RoleContext } from './host/registry.ts'
+import { applyRoleIsolation, decideIsolation, privatePathGuard, type GuardedExecution, type IsolationDecision } from './host/isolation.ts'
+import { RoleRegistry, startPhase, type RoleContext } from './host/registry.ts'
 import { runSealedEvaluation } from './host/sealed.ts'
 import { dshHome, StoreRegistry } from './host/stores.ts'
 import { SubagentRoleRuntime, supportsActivations, type SubagentConversation } from './host/subagent-runtime.ts'
-import { applyTask, episodeFor, initTask, taskStateSchema, type TaskMeta, type TaskState } from './host/task-state.ts'
+import { applyTask, episodeFor, initTask, STATE_TOOLS, taskStateSchema, type TaskMeta, type TaskState } from './host/task-state.ts'
 
 export { Config }
 
@@ -72,6 +74,12 @@ const REQUESTS_KEPT = 16
 
 /** Tools that delegate to or message other agents; role contexts never get them. */
 const DELEGATION_TOOLS = ['subagent', 'subagent_fork', 'workflow', 'send_message', 'interrupt_agent', 'list_agents']
+
+/** Tools that address another agent by id; a role context accepts input only from the harness. */
+const MESSAGING_TOOLS = new Set(['send_message', 'interrupt_agent'])
+
+/** Reserved transport tools a tool filter may not name. */
+const TRANSPORT_TOOLS = new Set(['run_code'])
 
 export const RSI_TOOLS = [
   'rsi_memory_list',
@@ -111,6 +119,14 @@ function service<T>(ctx: Context, key: string): T | undefined {
   return (ctx as unknown as { get(name: string): unknown }).get(key) as T | undefined
 }
 
+/** A role route as it will run: empty fields inherit the agent's live route, like dsh child options. */
+export function effectiveRoute(agent: Agent, route: { provider?: string, model?: string }): { provider: string, model: string } {
+  const live = agent.session.requestHeader()?.config
+  const parentProvider = live?.provider ?? agent.options.provider ?? ''
+  const parentModel = live?.model ?? agent.options.model ?? ''
+  return { provider: route.provider || parentProvider, model: route.model || parentModel }
+}
+
 /** Interactive Verifier kept alive across revisions within one main-agent turn. */
 interface LiveVerifier {
   conversation: SubagentConversation
@@ -126,12 +142,12 @@ export function apply(ctx: Context, config: Config): void {
   const transport: TransportPolicy = { ...config.transport }
   const canReserveIds = supportsActivations(ctx.subagents)
 
-  const frozen = async (store: MemoryStore): Promise<boolean> => frozenByConfig || (await store.isFrozen())
+  const frozen = async (store: MemoryStore): Promise<boolean> => frozenByConfig || (await store.frozen())
   const cwdOf = (session: Session): string =>
     service<{ get(session: Session): string }>(ctx, 'workingDirectory')?.get(session) ?? session.header.cwd ?? process.cwd()
-  const isolation = (): IsolationDecision => decideIsolation(ctx, config.verifier.isolation, canReserveIds)
-  const requireIsolation = (): IsolationDecision => {
-    const decision = isolation()
+  const isolation = (cwd: string): Promise<IsolationDecision> => decideIsolation(ctx, config.verifier.isolation, canReserveIds, cwd)
+  const requireIsolation = async (cwd: string): Promise<IsolationDecision> => {
+    const decision = await isolation(cwd)
     if (decision.mode === 'sandbox' && decision.unavailable) {
       throw new Error(`Verifier isolation "sandbox" is unavailable: ${decision.unavailable}. Set verifier.isolation to "rollback" or "auto". This is an infrastructure failure, not a verdict.`)
     }
@@ -167,7 +183,7 @@ export function apply(ctx: Context, config: Config): void {
     stateSchema: taskStateSchema,
     init: header => initTask(header),
     apply: (state, event) => applyTask(state, event),
-    stateVersion: 1,
+    stateVersion: 2,
   })
   const taskOf = (agent: Agent): TaskState => ctx.sessionProjections.stateOf(agent.session, 'dsh-rsi/task') ?? initTask(agent.session.header)
   const requestsOfAgent = (agent: Agent): RequestsState => ctx.sessionProjections.stateOf(agent.session, 'dsh-rsi/requests') ?? { texts: [], count: 0 }
@@ -196,7 +212,7 @@ export function apply(ctx: Context, config: Config): void {
     const role = roles.get(agent.id)
     if (role) {
       // A failure here fails the child's creation: a Verifier is never started unconfined.
-      applyRoleIsolation(agent, role, cwdOf)
+      applyRoleIsolation(agent, role)
       return undefined
     }
     if (isSubagent(agent)) return undefined
@@ -214,6 +230,25 @@ export function apply(ctx: Context, config: Config): void {
   ctx.on('session/event', (session, event) => {
     // Backstop for turns that end without turn-stopping (errors, aborts): no Verifier outlives its turn.
     if (event.type === 'turn/end' && verifiers.has(session.id)) void closeVerifier(session.id)
+    const role = roles.get(session.id)
+    if (!role) return
+    // Per-step facts of a role child, read from its own log.
+    switch (event.type) {
+      case 'step/start':
+        role.stepKey = `${event.data.turn}:${event.data.step}`
+        role.stepToolCalls = 0
+        role.stepToolBlocks = 0
+        break
+      case 'assistant/message':
+        role.lastText = event.data.message.content.map(block => (block.type === 'text' ? block.text : '')).join('').trim()
+        role.stepToolBlocks = event.data.message.content.filter(block => block.type === 'tool-call').length
+        break
+      case 'tool/call':
+        role.stepToolCalls++
+        break
+      default:
+        break
+    }
   })
   ctx.on('tools/result', exec => {
     const role = exec.agent ? roles.get(exec.agent.id) : undefined
@@ -222,7 +257,17 @@ export function apply(ctx: Context, config: Config): void {
       role.sinceStop++
     }
   })
-  ctx.on('agent/turn-stopping', async ({ agent }) => {
+  // A role context takes input only from the harness: messages other agents address to it never enter a step.
+  ctx.on('agent/pre-step', async (payload, next) => {
+    const decision = await next()
+    const agent = (payload as { agent?: Agent }).agent
+    if (decision.kind !== 'enter' || agent === undefined || !roles.get(agent.id)) return decision
+    const messages = decision.messages.filter(message => (message.source as { kind: string }).kind !== 'agent-message')
+    return messages.length === decision.messages.length ? decision : { ...decision, messages }
+  })
+
+  const say = (value: string) => createUserMessage({ content: [{ type: 'text', text: value }], source: { kind: 'user' } })
+  ctx.on('agent/turn-stopping', async ({ agent, signal }) => {
     const role = roles.get(agent.id)
     if (!role) {
       // Hosts wait for children at the turn boundary; the interactive Verifier never outlives the turn.
@@ -230,12 +275,66 @@ export function apply(ctx: Context, config: Config): void {
       return
     }
     if (role.closing || role.channel.closed || role.channel.ended) return
+    if (role.stepToolCalls > 0) {
+      // A stop right after a step that ran tools comes from a sticky output-limit turn end, not a natural stop.
+      agent.steer(say(toolStepContinuation()))
+      return
+    }
     // RSIAgent same-context continuation: a segment that ended without a handoff resumes in the same context.
     role.stops++
     role.actionlessStops = role.sinceStop === 0 ? role.actionlessStops + 1 : 0
     role.sinceStop = 0
-    if (role.actionlessStops >= transport.actionlessLimit || role.stops > transport.ceiling) return
-    agent.steer(createUserMessage({ content: [{ type: 'text', text: stallContinuation() }], source: { kind: 'user' } }))
+    const reason = role.actionlessStops >= transport.actionlessLimit
+      ? `${role.actionlessStops} consecutive segments ended without any action or handoff`
+      : role.stops > transport.ceiling
+        ? `the emergency ceiling of ${transport.ceiling} continuations was reached without a handoff`
+        : undefined
+    if (reason === undefined) {
+      agent.steer(say(role.stepToolBlocks > 0 ? truncatedContinuation() : stallContinuation()))
+      return
+    }
+    // The phase is transport infrastructure, as in RSIAgent, but the context lives on: hold the turn
+    // here until the engine's next message (a forced inspection's learning, or the close).
+    let next
+    try {
+      next = await role.channel.hold(role.lastText, role.sinceHandoff, reason, signal)
+    } catch {
+      return
+    }
+    if (next === CLOSED) return
+    startPhase(role)
+    agent.steer(say(next))
+  })
+
+  // Global guards keyed by role, installed once: they also cover children whose id becomes known only
+  // after creation (dsh 0.2.0-rc), tools registered after a child started, and PTC sub-dispatches.
+  const pathGuards = new WeakMap<RoleContext, (execution: GuardedExecution) => string | undefined>()
+  const verifierAllowed = new Set([...config.verifier.allowTools, 'rsi_handoff', ...TRANSPORT_TOOLS])
+  const verifierDenied = new Set(config.verifier.denyTools)
+  const pendingGuard = () => privatePathGuard(roles.pendingHidden, cwdOf)
+  ctx.tools.guard(execution => {
+    const args = (execution.arguments ?? {}) as Record<string, unknown>
+    if (MESSAGING_TOOLS.has(execution.name)) {
+      const target = typeof args.agent_id === 'string' ? args.agent_id : typeof args.target === 'string' ? args.target : undefined
+      if (target !== undefined && roles.isRoleId(target)) return 'That agent is an RSI role context; it accepts messages only from the harness.'
+    }
+    const agent = execution.agent
+    if (!agent) return undefined
+    const role = roles.get(agent.id)
+    if (!role) {
+      // An unreserved start whose id is not known yet: fail closed on every hidden root in flight.
+      return isSubagent(agent) && roles.starting ? pendingGuard()(execution) : undefined
+    }
+    if (role.role === 'verifier' && (!verifierAllowed.has(execution.name) || verifierDenied.has(execution.name))) {
+      return `${execution.name} is not available to the Verifier: it inspects with read, search, and confined execution tools only.`
+    }
+    if (role.hidden.length === 0) return undefined
+    let guard = pathGuards.get(role)
+    if (!guard) {
+      guard = privatePathGuard(role.hidden, cwdOf)
+      pathGuards.set(role, guard)
+    }
+    return guard(execution)
   })
 
   // ---------------------------------------------------------------- memory views
@@ -271,6 +370,7 @@ export function apply(ctx: Context, config: Config): void {
 
   const writableView = async (agent: Agent, tool: string, signal: AbortSignal): Promise<MemoryView & { draft: MemoryDraft }> => {
     const view = await viewOf(agent, tool, signal)
+    if (await view.store.frozen()) throw new Error(`${tool}: memory is frozen for test-time reuse; it cannot change`)
     if (!view.draft) {
       const learning = view.role ? undefined : taskOf(agent).learning
       if (learning && learning.owner !== agent.id) throw new Error(`${tool}: the open learning phase belongs to another session; call rsi_learn to open this session's own`)
@@ -366,27 +466,39 @@ export function apply(ctx: Context, config: Config): void {
   }))
 
   // ---------------------------------------------------------------- role runtime
-  const interactiveOnly = async (agent: Agent, tool: string, signal: AbortSignal) => {
+  const interactiveOnly = async (agent: Agent, tool: string, signal: AbortSignal, parent?: unknown) => {
     if (await roleOf(agent, signal)) throw new Error(`${tool} is not available inside an RSI role context; use rsi_handoff`)
+    // dsh 0.2.0 records no structured result for run_code sub-calls, so the task state would never see this call's outcome.
+    if (parent !== undefined && !canReserveIds && STATE_TOOLS.includes(tool as typeof STATE_TOOLS[number])) {
+      throw new Error(`${tool} must be called directly, not from run_code, on this dsh version (set DSH_TOOLS_MODE=native, or use dsh >= 0.2.1-alpha.2)`)
+    }
   }
 
-  const known = (names: readonly string[]) => names.filter(toolName => ctx.tools.get(toolName) !== undefined)
-  const toolFilter = (role: RoleKind): ToolRestriction => {
-    const common = ['rsi_submit', 'rsi_learn', 'rsi_memory_commit', 'rsi_explore', ...known(DELEGATION_TOOLS)]
+  /** Names the child will actually inherit: resolved in the parent's scope, so agent-preset tools count too. */
+  const known = (names: readonly string[], parent: Agent) =>
+    [...new Set(names)].filter(toolName => !TRANSPORT_TOOLS.has(toolName) && ctx.tools.get(toolName, parent) !== undefined)
+  const toolFilter = (role: RoleKind, parent: Agent): ToolRestriction => {
+    const common = known(['rsi_submit', 'rsi_learn', 'rsi_memory_commit', 'rsi_explore', ...DELEGATION_TOOLS], parent)
     switch (role) {
       case 'actor':
-        return { deny: [...common, 'rsi_notes'] }
+        return { deny: [...common, ...known(['rsi_notes'], parent)] }
       case 'curriculum':
         return {
           deny: [
             ...common,
-            'rsi_memory_write',
-            'rsi_memory_delete',
-            ...(config.exploration.curriculumMemoryAccess === 'none' ? ['rsi_memory_list', 'rsi_memory_read', 'rsi_memory_search'] : []),
+            ...known([
+              'rsi_memory_write',
+              'rsi_memory_delete',
+              ...(config.exploration.curriculumMemoryAccess === 'none' ? ['rsi_memory_list', 'rsi_memory_read', 'rsi_memory_search'] : []),
+            ], parent),
           ],
         }
-      case 'verifier':
-        return { deny: [...new Set([...RSI_TOOLS.filter(toolName => toolName !== 'rsi_handoff'), ...known(DELEGATION_TOOLS), ...known(config.verifier.denyTools)])] }
+      case 'verifier': {
+        // An allow-list: MCP tools and anything else acting outside the sandbox stay out (the guard backs this up).
+        const allow = known([...config.verifier.allowTools, 'rsi_handoff'], parent)
+        const deny = known([...RSI_TOOLS.filter(toolName => toolName !== 'rsi_handoff'), ...DELEGATION_TOOLS, ...config.verifier.denyTools], parent)
+        return deny.length > 0 ? { allow, deny } : { allow }
+      }
       default: {
         const unreachable: never = role
         throw new Error(`unknown role ${String(unreachable)}`)
@@ -400,9 +512,9 @@ export function apply(ctx: Context, config: Config): void {
     return { ...(chosen.provider ? { provider: chosen.provider } : {}), ...(chosen.model ? { model: chosen.model } : {}) }
   }
 
-  /** Actor-private state a Verifier's file tools must not touch. */
+  /** Actor-private state a Verifier's file tools must not touch: memory, session logs, and projection caches. */
   const hiddenFor = (store: MemoryStore) => (role: RoleKind): string[] =>
-    role === 'verifier' ? [store.root, join(dshHome(), 'sessions')] : []
+    role === 'verifier' ? [store.root, join(dshHome(), 'sessions'), join(dshHome(), 'storages')] : []
 
   const runtimeFor = (parent: Agent, store: MemoryStore, signal: AbortSignal, observe: (event: EngineEvent) => void, readOnlyVerifier: boolean) =>
     new SubagentRoleRuntime({
@@ -460,54 +572,67 @@ export function apply(ctx: Context, config: Config): void {
     output: { schema: STATE_OUTPUT_SCHEMA, render: (_args, value) => text(value.message ?? ''), presentationMeta: (_args, value) => value.state ?? null },
     async execute(args, exec) {
       const agent = requireAgent(exec.agent, 'rsi_submit')
-      await interactiveOnly(agent, 'rsi_submit', exec.signal)
+      await interactiveOnly(agent, 'rsi_submit', exec.signal, exec.parent)
       const task = taskOf(agent)
       if (task.learning && task.learning.owner === agent.id) throw new Error('a learning phase is open; finish it with rsi_memory_commit before submitting again')
-      const decision = requireIsolation()
       const store = await stores.forAgent(agent)
+      // The candidate is the session's project, not a transient working directory inside it.
+      const cwd = stores.projectDir(agent)
+      const decision = await requireIsolation(cwd)
       const requests = requestsOfAgent(agent).count
       const newTask = task.verdict === 'PASS' && requests > task.requestCount
-      if (newTask) await closeVerifier(agent.id)
+      // A Verifier context that ended or failed between submissions cannot continue: start a fresh one.
+      if (newTask || verifiers.get(agent.id)?.conversation.ended) await closeVerifier(agent.id)
       const generation = (newTask ? 0 : task.generation) + 1
-      const cwd = cwdOf(agent.session)
       const excludes = harnessPaths(cwd, agent, store)
+      exec.signal.throwIfAborted()
       const before = await workspaceState(cwd, excludes)
-      const checkpoint = await WorkspaceCheckpoint.take(cwd, excludes, { maxBytes: config.verifier.checkpointMaxBytes, maxFiles: config.verifier.checkpointMaxFiles })
+      let checkpoint: WorkspaceCheckpoint
+      try {
+        checkpoint = await WorkspaceCheckpoint.take(cwd, excludes, { maxBytes: config.verifier.checkpointMaxBytes, maxFiles: config.verifier.checkpointMaxFiles })
+      } catch (error) {
+        throw new Error(`the candidate could not be checkpointed (${String(error)}). This is an infrastructure failure, not a verdict.`)
+      }
 
-      let live = verifiers.get(agent.id)
-      const fresh = live === undefined
-      if (!live) {
-        const controller = new AbortController()
-        const runtime = runtimeFor(agent, store, controller.signal, event => logger.debug('%o', event), decision.mode === 'sandbox')
-        live = {
-          conversation: await runtime.open({
-            role: 'verifier',
-            label: `rsi verifier (${agent.id.slice(0, 8)})`,
-            system: verifierSystem(config.verifier.allowUnverified, decision.mode),
-            cwd,
-            memory: { access: 'none' },
-          }),
-          controller,
-        }
-        verifiers.set(agent.id, live)
-      }
-      const priorReports: string[] = []
-      if (fresh && !newTask) {
-        for (const ref of task.reports) priorReports.push((await store.getReport(ref.sha256)) ?? `(report unavailable: generation ${ref.generation}, ${ref.verdict}, sha256 ${ref.sha256})`)
-      }
-      const leads = task.verdict === 'UNVERIFIED' && args.evidence_leads?.length
-        ? formatLeads(args.evidence_leads.map(lead => ({ claim: lead.claim ?? '', probe: lead.probe ?? '' })).filter(lead => lead.probe.trim() !== ''))
-        : undefined
-      const conversation = live.conversation
-      const onAbort = () => {
-        verifiers.delete(agent.id)
-        void conversation.abort()
-      }
-      exec.signal.addEventListener('abort', onAbort, { once: true })
       let result
       let changed: string[] = []
+      let onAbort: (() => void) | undefined
       try {
-        result = await inspect(conversation, {
+        exec.signal.throwIfAborted()
+        let live = verifiers.get(agent.id)
+        const fresh = live === undefined
+        if (!live) {
+          const controller = new AbortController()
+          const runtime = runtimeFor(agent, store, controller.signal, event => logger.debug('%o', event), decision.mode === 'sandbox')
+          live = {
+            conversation: await runtime.open({
+              role: 'verifier',
+              label: `rsi verifier (${agent.id.slice(0, 8)})`,
+              system: verifierSystem(config.verifier.allowUnverified, decision.mode),
+              cwd,
+              memory: { access: 'none' },
+            }),
+            controller,
+          }
+          verifiers.set(agent.id, live)
+        }
+        const priorReports: string[] = []
+        if (fresh && !newTask) {
+          for (const ref of task.reports) priorReports.push((await store.getReport(ref.sha256)) ?? `(report unavailable: generation ${ref.generation}, ${ref.verdict}, sha256 ${ref.sha256})`)
+        }
+        const leads = task.verdict === 'UNVERIFIED' && args.evidence_leads?.length
+          ? formatLeads(args.evidence_leads.map(lead => ({ claim: lead.claim ?? '', probe: lead.probe ?? '' })).filter(lead => lead.probe.trim() !== ''))
+          : undefined
+        const current = live
+        onAbort = () => {
+          // A cancel reaches the child even while it is still starting.
+          if (verifiers.get(agent.id) === current) verifiers.delete(agent.id)
+          current.controller.abort()
+          void current.conversation.abort()
+        }
+        exec.signal.addEventListener('abort', onAbort, { once: true })
+        if (exec.signal.aborted) onAbort()
+        result = await inspect(current.conversation, {
           task: authoritativeTask(agent),
           generation,
           mechanicalContext: before.summary,
@@ -521,14 +646,20 @@ export function apply(ctx: Context, config: Config): void {
         await closeVerifier(agent.id)
         throw error
       } finally {
-        exec.signal.removeEventListener('abort', onAbort)
-        changed = await checkpoint.restore()
-        await checkpoint.dispose()
+        if (onAbort) exec.signal.removeEventListener('abort', onAbort)
+        try {
+          changed = await checkpoint.restore()
+        } finally {
+          await checkpoint.dispose()
+        }
       }
+      exec.signal.throwIfAborted()
       if (result.kind === 'infra') {
         await closeVerifier(agent.id)
         throw new Error(`verification is unavailable: ${result.reason}. This is an infrastructure failure, not a verdict.`)
       }
+      // A verdict published as the context's last words cannot be continued: the next submission opens a fresh one.
+      if (verifiers.get(agent.id)?.conversation.ended) await closeVerifier(agent.id)
       const note = changed.length === 0
         ? ''
         : checkpoint.restores
@@ -552,7 +683,7 @@ export function apply(ctx: Context, config: Config): void {
           throw new Error(`unknown verdict ${String(unreachable)}`)
         }
       }
-      return stateResult(guidance + note, { rsi: 1, op: 'submit', newTask, generation, verdict: result.verdict, requestCount: requests, report: ref })
+      return stateResult(guidance + note, { rsi: 1, op: 'submit', newTask, generation, verdict: result.verdict, requestCount: requests, report: ref, session: agent.id })
     },
     presentCall: () => ({ card: 'generic', title: 'RSI verification', kind: 'other' }),
   }))
@@ -564,7 +695,7 @@ export function apply(ctx: Context, config: Config): void {
     output: { schema: STATE_OUTPUT_SCHEMA, render: (_args, value) => text(value.message ?? ''), presentationMeta: (_args, value) => value.state ?? null },
     async execute(_args, exec) {
       const agent = requireAgent(exec.agent, 'rsi_learn')
-      await interactiveOnly(agent, 'rsi_learn', exec.signal)
+      await interactiveOnly(agent, 'rsi_learn', exec.signal, exec.parent)
       const store = await stores.forAgent(agent)
       if (await frozen(store)) throw new Error('memory is frozen for test-time reuse; no learning phase exists')
       const task = taskOf(agent)
@@ -574,18 +705,23 @@ export function apply(ctx: Context, config: Config): void {
       if (task.verdictSeq === null) throw new Error('rsi_learn needs a recorded verdict')
       if (task.closedVerdictSeq === task.verdictSeq) throw new Error('the learning phase for this verdict already ended; durable memory was not changed')
       const episode = episodeFor(agent.id, task.verdictSeq)
-      if (await store.findCommit(episode)) {
-        return stateResult('This experience was already promoted to durable memory; there is nothing left to learn from it.', { rsi: 1, op: 'commit', episode })
+      // A fork inherits its origin's verdict: whichever session learned from it first, it is learned once.
+      const origin = task.verdictSession !== null && task.verdictSession !== agent.id ? episodeFor(task.verdictSession, task.verdictSeq) : undefined
+      for (const candidate of origin === undefined ? [episode] : [episode, origin]) {
+        if (await store.findCommit(candidate)) {
+          return stateResult('This experience was already promoted to durable memory; there is nothing left to learn from it.', { rsi: 1, op: 'commit', episode })
+        }
+        if (await store.isQuarantined(candidate)) throw new Error('the learning phase for this verdict already ended; durable memory was not changed')
       }
       // The attempt is over: the Verifier context ends before learning starts.
       await closeVerifier(agent.id)
       await store.openDraft(episode)
       const last = task.reports.at(-1)
       const report = (last && (await store.getReport(last.sha256))) ?? '(the final report is in your history above)'
-      return stateResult(distillationMessage(task.verdict, report, 'actor'), {
+      return stateResult(distillationMessage(task.verdict, report, 'actor', store.limits), {
         rsi: 1,
         op: 'learn',
-        learning: { episode, owner: agent.id, stage: 'distill', outcome: task.verdict, verdictSeq: task.verdictSeq },
+        learning: { episode, owner: agent.id, stage: 'distill', outcome: task.verdict, verdictSeq: task.verdictSeq, stageStep: null },
       })
     },
   }))
@@ -597,8 +733,9 @@ export function apply(ctx: Context, config: Config): void {
     output: { schema: STATE_OUTPUT_SCHEMA, render: (_args, value) => text(value.message ?? ''), presentationMeta: (_args, value) => value.state ?? null },
     async execute(_args, exec) {
       const agent = requireAgent(exec.agent, 'rsi_memory_commit')
-      await interactiveOnly(agent, 'rsi_memory_commit', exec.signal)
-      const learning = taskOf(agent).learning
+      await interactiveOnly(agent, 'rsi_memory_commit', exec.signal, exec.parent)
+      const task = taskOf(agent)
+      const learning = task.learning
       if (!learning) throw new Error('no learning phase is open; call rsi_learn after a terminal verdict')
       if (learning.owner !== agent.id) throw new Error('the open learning phase belongs to another session; call rsi_learn to open this session\'s own')
       const store = await stores.forAgent(agent)
@@ -606,9 +743,20 @@ export function apply(ctx: Context, config: Config): void {
         await stores.refresh(store)
         return stateResult('This learning phase was already promoted to durable memory.', { rsi: 1, op: 'commit', episode: learning.episode })
       }
+      if (await frozen(store)) {
+        // Test-time reuse never changes memory; the draft stays for a later learning phase.
+        return stateResult('Memory is frozen for test-time reuse, so nothing was promoted. The draft is kept; after memory is unfrozen, call rsi_learn to continue this learning phase.', { rsi: 1, op: 'close', episode: learning.episode, terminal: false })
+      }
+      // Each stage's instructions must be read before the next stage: never in the same model step.
+      if (learning.stageStep !== null && learning.stageStep === task.callStep) {
+        throw new Error(`call rsi_memory_commit in a later message, after acting on the ${learning.stage === 'distill' ? 'distillation' : 'reconciliation'} instructions above`)
+      }
       if (learning.stage === 'distill') return stateResult(reconciliationMessage('actor'), { rsi: 1, op: 'reconcile', episode: learning.episode })
       const draft = await store.reopenDraft(learning.episode)
       if (!draft) {
+        if (await store.isQuarantined(learning.episode)) {
+          return stateResult('this learning phase could not be promoted; durable memory is unchanged', { rsi: 1, op: 'close', episode: learning.episode, terminal: true })
+        }
         return stateResult('The learning draft no longer exists, so nothing was promoted. Call rsi_learn to redo the learning phase against the current memory.', { rsi: 1, op: 'close', episode: learning.episode, terminal: false })
       }
       try {
@@ -623,8 +771,10 @@ export function apply(ctx: Context, config: Config): void {
           await store.discardDraft(learning.episode)
           return stateResult(`${error.message}. Nothing was promoted; call rsi_learn to redo the learning phase.`, { rsi: 1, op: 'close', episode: learning.episode, terminal: false })
         }
-        if (error instanceof MemoryQuarantineError || error instanceof MemoryFrozenError) {
-          await store.discardDraft(learning.episode)
+        if (error instanceof MemoryFrozenError) {
+          return stateResult(`${error.message}. The draft is kept; after memory is unfrozen, call rsi_learn to continue this learning phase.`, { rsi: 1, op: 'close', episode: learning.episode, terminal: false })
+        }
+        if (error instanceof MemoryQuarantineError) {
           return stateResult(error.message, { rsi: 1, op: 'close', episode: learning.episode, terminal: true })
         }
         // Limits and I/O failures keep the draft open: trim or fix it, then commit again.
@@ -645,8 +795,14 @@ export function apply(ctx: Context, config: Config): void {
       const agent = requireAgent(exec.agent, 'rsi_handoff')
       const role = await roleOf(agent, exec.signal)
       if (!role) throw new Error('rsi_handoff is only available inside RSI role contexts')
+      // One handoff per model step: a second call in the same message would answer a message the role never read.
+      if (role.stepKey !== '' && role.handoffStep === role.stepKey) {
+        throw new Error('only one rsi_handoff per message: your previous handoff in this message was already delivered; read its reply above first')
+      }
+      role.handoffStep = role.stepKey
       const actions = role.sinceHandoff
-      role.sinceHandoff = 0
+      // Each handoff starts a new phase: both transport bounds apply per phase.
+      startPhase(role)
       const next = await role.channel.handoff(args.text, actions, exec.signal)
       if (next === CLOSED) {
         exec.concludeTurn()
@@ -695,12 +851,15 @@ export function apply(ctx: Context, config: Config): void {
       if (!canReserveIds) throw new Error('rsi_explore needs dsh >= 0.2.1-alpha.2: this dsh version cannot start a role sub-agent in its own project root')
       const store = await stores.forAgent(agent)
       if (await frozen(store)) throw new Error('memory is frozen for test-time reuse; exploration would change it')
-      const decision = requireIsolation()
+      const projectDir = stores.projectDir(agent)
       const lineage = args.lineage ?? `${args.phase}-${new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14)}`
       if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(lineage)) throw new Error('lineage must match [a-z0-9][a-z0-9_-]{0,63}')
-      const projectDir = stores.projectDir(agent)
+      const workRoot = stores.stateRoot(projectDir)
+      await mkdir(workRoot, { recursive: true })
+      const decision = await requireIsolation(workRoot)
       const paths = { workspace: join(stores.stateRoot(projectDir), 'lineages', lineage), private: join(store.root, 'lineages', lineage) }
-      if (await access(join(paths.private, 'result.json')).then(() => true, () => false)) throw new Error(`lineage ${lineage} already finished; choose a new lineage id`)
+      // Lineages are not resumable: a started id (finished or interrupted) is never reused, so its episodes stay unique.
+      if (await access(join(paths.private, 'lineage.json')).then(() => true, () => false)) throw new Error(`lineage ${lineage} already exists; choose a new lineage id`)
 
       let targetFixtures
       if (args.target_fixtures !== undefined) {
@@ -713,25 +872,33 @@ export function apply(ctx: Context, config: Config): void {
         targetFixtures = await captureTree(source, join(paths.private, 'target-fixtures'))
       }
 
-      const escalation = Boolean(config.roles.escalation.provider || config.roles.escalation.model)
+      // Routes as they will run: empty fields inherit the calling agent's live route (RSIAgent compares effective models).
+      const effective = (route: RoleRoute) => effectiveRoute(agent, config.roles[route])
+      const sameRoute = (a: RoleRoute, b: RoleRoute) => effective(a).provider === effective(b).provider && effective(a).model === effective(b).model
+      const escalation = Boolean(config.roles.escalation.provider || config.roles.escalation.model) && !sameRoute('escalation', 'actor')
       const engineConfig: EngineConfig = {
         ...config.exploration,
         inventoryListed: config.promptInventory,
         transport,
         verifierMechanics: decision.mode,
         escalation,
-        crossModelVerifier: escalation
-          && (config.roles.escalation.provider ?? '') === (config.roles.verifier.provider ?? '')
-          && (config.roles.escalation.model ?? '') === (config.roles.verifier.model ?? ''),
+        crossModelVerifier: escalation && sameRoute('escalation', 'verifier'),
       }
       const observe = (event: EngineEvent) => logger.info('%s %o', event.type, event)
-      const deps = { runtime: runtimeFor(agent, store, exec.signal, observe, decision.mode === 'sandbox'), store, config: engineConfig, observe, signal: exec.signal }
+      // Every context the lineage opens is disposed when the tool settles, whatever path it takes.
+      const controller = new AbortController()
+      const forward = () => controller.abort(exec.signal.reason)
+      if (exec.signal.aborted) forward()
+      else exec.signal.addEventListener('abort', forward, { once: true })
+      const deps = { runtime: runtimeFor(agent, store, controller.signal, observe, decision.mode === 'sandbox'), store, config: engineConfig, observe, signal: exec.signal }
       try {
         const result = args.phase === 'broad'
           ? await runBroadExploration(deps, { lineage, direction: args.direction, paths })
           : await runDeepExploration(deps, { lineage, target: args.direction, paths, ...(targetFixtures ? { targetFixtures } : {}) })
         return JSON.parse(JSON.stringify(result))
       } finally {
+        exec.signal.removeEventListener('abort', forward)
+        controller.abort()
         await stores.refresh(store)
       }
     },
@@ -745,7 +912,7 @@ export function apply(ctx: Context, config: Config): void {
       const inventory = await store.inventory()
       const journal = await store.journal()
       const task = taskOf(agent)
-      const decision = isolation()
+      const decision = await isolation(stores.projectDir(agent))
       const recent = journal.slice(-5).map(record => `  ${record.ts}  ${record.kind}/${record.outcome}  ${record.episode}  +${record.created.length} ~${record.modified.length} -${record.deleted.length}`)
       return [
         `RSI memory: ${store.root}`,

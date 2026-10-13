@@ -9,5 +9,4 @@
       name: dsh-rsi
       config:
         mode: learn
-        stateDir: .dsh-rsi
         subagentProvider: spawn

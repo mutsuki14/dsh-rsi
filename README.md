@@ -36,7 +36,7 @@ The task state (Verifier generation, report references, verdict, learning stage)
 | phase | paper | flow |
 |---|---|---|
 | `broad` | Phase 1 · BRS | The Curriculum authors waves of independent projects and builds each project's fixture tree. The harness checks each tree's shape, captures it privately, and replays it into a fresh project root. Every branch starts from the same memory snapshot and gets a fresh Actor and a fresh Verifier. After the complete wave is verified (the **wave barrier**), the same Actor contexts distill **serially** in authored order, each against the latest memory. |
-| `deep` | Phase 2 · DRS | A fresh Actor attempts an immutable target (optionally replaying `target_fixtures`). FAIL is terminal for the attempt; UNVERIFIED asks the same Actor for evidence leads. Repeated UNVERIFIED rounds or an actionless Actor stall the attempt: one forced inspection follows, then a fresh-context resume with a work log (optionally on an escalation model, with the Verifier swapped to the Actor's model). The same Actor distills, reconciles, writes a diagnosis for the Curriculum, and only then is memory promoted. The Curriculum picks practice (with fixtures and a read-only original-fixture view for its Verifier) until `READY_FOR_TARGET` or `STALLED`. After any practice, a fresh retry of the unchanged target is mandatory, also when the practice budget runs out. |
+| `deep` | Phase 2 · DRS | A fresh Actor attempts an immutable target (optionally replaying `target_fixtures`). FAIL is terminal for the attempt; UNVERIFIED asks the same Actor for evidence leads. Repeated UNVERIFIED rounds or an actionless Actor stall the attempt: one forced inspection follows. A terminal verdict is then learned by the same, held Actor; otherwise a fresh-context resume gets the latest work log (optionally on an escalation model, with the Verifier swapped once to the Actor's model). The same Actor distills, reconciles, writes a diagnosis for the Curriculum, and only then is memory promoted. The Curriculum picks practice (with fixtures and a read-only original-fixture view for its Verifier) until `READY_FOR_TARGET` or `STALLED`. After any practice, a fresh retry of the unchanged target is mandatory, also when the practice budget runs out. |
 | — | Phase 3 | Set `mode: frozen`, or run `/rsi-freeze`. `/rsi-eval <lineage>` runs the configured sealed evaluator. |
 
 Stop policies:
@@ -54,7 +54,11 @@ Every role (Actor, Verifier, Curriculum) is a sub-agent started with `ctx.subage
 - a reserved child id, so creation hooks can isolate it before its first step;
 - a tool filter that removes every delegation tool (`subagent`, `workflow`, `send_message`, …) and the interactive RSI tools.
 
-At each handoff, a role calls `rsi_handoff(text)`. That tool call stays pending until the engine sends the next message, which becomes the tool result; closing the context resolves it and concludes the turn without another model call. A segment that ends without a handoff is steered back into the **same** context (RSIAgent's same-context continuation). Three consecutive segments without any tool action end the context as unscored infrastructure, as in RSIAgent; there is no fixed retry count.
+At each handoff, a role calls `rsi_handoff(text)`. That tool call stays pending until the engine sends the next message, which becomes the tool result; closing the context resolves it and concludes the turn without another model call. Only one handoff per model message is accepted, so a duplicated call never answers a message the role has not read.
+
+A segment that ends without a handoff is steered back into the **same** context (RSIAgent's same-context continuation). Three consecutive segments without any tool action end the *phase* as unscored transport infrastructure, as in RSIAgent, but not the context: the harness holds the child at its turn boundary, so after a stalled target attempt the forced inspection's verdict is learned by the same Actor that did the work. Both bounds (`actionlessLimit`, `ceiling`) count per handoff phase, and stops that follow a tool step in a turn that hit the output limit are not counted. There is no fixed retry count.
+
+Role contexts take input only from the harness: `send_message`/`interrupt_agent` addressed to a role child are refused, and agent messages never enter a role's steps.
 
 ## Install
 
@@ -87,7 +91,7 @@ dsh web                                                   # or: dsh headless "ta
 | `rsi_handoff` | role sub-agents | hand off to the engine and wait for its next message |
 | `rsi_notes` | Curriculum | replace its private search notes (never shown to the Actor or Verifier) |
 
-Verifiers get no memory tools, no delegation tools, and none of the tools in `verifier.denyTools` (default: `write`, `edit`, `web_fetch`, `web_search`).
+Verifiers work from an allow-list (`verifier.allowTools`: read, search, and confined-execution tools) minus `verifier.denyTools` (default: `write`, `edit`, `web_fetch`, `web_search`). They get no memory, delegation, or MCP tools: MCP servers act outside the sandbox. A global guard enforces this for tools registered after a child started and for `run_code` sub-calls.
 
 Commands (human-only; command results never reach the model):
 
@@ -99,11 +103,13 @@ Commands (human-only; command results never reach the model):
 
 `verifier.isolation` (default `auto`):
 
-- `sandbox`: the Verifier child is pinned to dsh's `read-only` sandbox mode at creation, before its first step. Its file tools, bash, background jobs, terminals, and `run_code` cannot write anywhere, and escalation is rejected; the Actor keeps its own policy. File tools also refuse Actor-private paths. Fails loudly when the profile has no sandbox policy or the dsh version cannot reserve child ids.
+- `sandbox`: the Verifier child is pinned to dsh's `read-only` sandbox mode at creation, before its first step. Its file tools, bash, background jobs, terminals, and `run_code` cannot write anywhere, and escalation is rejected; the Actor keeps its own policy. File tools also refuse Actor-private paths (memory, session logs, projection caches; `..` is resolved physically, as the filesystem does). Chosen only when a preflight shows a sandbox backend really confines a read-only command; an explicit `sandbox` fails loudly otherwise.
 - `rollback`: the Verifier may write; the harness restores the candidate afterwards.
 - `auto`: `sandbox` when available, otherwise `rollback`.
 
-In every mode the interactive candidate (tracked and untracked-but-not-ignored files) is checkpointed before an inspection and restored if it changed; practice and target project roots are copied and restored the same way.
+In every mode the interactive candidate (the session's project: tracked and untracked-but-not-ignored files) is checkpointed before an inspection and restored if it changed; files that existed before (ignored ones included) are never deleted, and a workspace too large to copy is compared by size and time and reported. Practice and target project roots are copied whole and restored when anything in them changed, `.git` and dependency trees included.
+
+Host-side `git` (change facts, checkpoints) never runs repository-planted programs: hooks, fsmonitor, external diff, textconv, and filter drivers the repository defines are disabled.
 
 ## Configuration
 
@@ -114,7 +120,7 @@ Override the row by id in your profile's `cordis.patch.yml`. An override replace
   name: dsh-rsi
   config:
     mode: learn                # frozen = Phase 3 test-time reuse
-    stateDir: .dsh-rsi         # workspace dir for lineage project roots only
+    stateDir: ''               # '' = $DSH_HOME/rsi-work/<project>-<hash>: lineage project roots, outside the workspace
     memoryDir: ''              # '' = $DSH_HOME/rsi/<project>-<hash>, outside the workspace
     subagentProvider: spawn
     roles:                     # optional model routes; a different Verifier model strengthens independence
@@ -124,10 +130,11 @@ Override the row by id in your profile's `cordis.patch.yml`. An override replace
       isolation: auto          # sandbox | rollback | auto
       allowUnverified: true
       taskMessages: 3
+      allowTools: [read, read_image, grep, glob, bash, pwsh, job_output, job_list, job_kill, run_code, lsp, skill, todo_write, working_directory]
       denyTools: [write, edit, web_fetch, web_search]
     transport:
-      actionlessLimit: 3       # RSIAgent: three actionless segments are infrastructure
-      ceiling: 24              # emergency bound, not a retry count
+      actionlessLimit: 3       # RSIAgent: three actionless segments end a phase as infrastructure
+      ceiling: 24              # emergency bound per phase, not a retry count
     exploration:
       waveCeiling: 16          # host capacity; the Curriculum chooses wave width below it
       waveConcurrency: 1
@@ -152,17 +159,22 @@ Every field is documented in [`src/config.ts`](src/config.ts).
 ```
 $DSH_HOME/rsi/<project>-<hash>/     (memoryDir; outside every role's working directory)
   memory/                canonical tree (Actor-owned, no imposed schema)
-  drafts/<episode>[.json] learning-phase working copies and their metadata
+  drafts/<episode>[.json] learning-phase working copies and their metadata (written last, removed first)
   journal.jsonl          append-only commits: episode, kind, outcome, before/after tree hashes, delta
+  commit.pending.json    an install in flight; recovery finishes or drops it
+  quarantined/<episode>  learning phases the silent audit refused
   history/NNNN/          full snapshot after each commit (memory.keepHistory)
   reports/<sha256>.md    content-addressed Verifier reports, re-hashed on read
   frozen.json            freeze marker with the frozen tree hash
-  lineages/<id>/         events.jsonl, result.json, curriculum_notes.md, fixture captures, wave snapshots
+  .lock                  cross-process mutation lock (two dsh processes in one project)
+  lineages/<id>/         events.jsonl, result.json, curriculum_notes.md, fixture captures, wave snapshots, final-candidate/
   sealed/<id>/<run>/     sealed evaluations (candidate copy, task, evaluation.json)
-<project>/.dsh-rsi/lineages/<id>/   practice and target project roots (what roles work in)
+$DSH_HOME/rsi-work/<project>-<hash>/lineages/<id>/   practice and target project roots (what roles work in)
 ```
 
-The tree hash matches RSIAgent's `tree_sha256` byte for byte, and a unit test checks this.
+The tree hash matches RSIAgent's `tree_sha256` byte for byte, and a unit test checks this. Memory written by dsh-rsi 0.1 inside the workspace (`<project>/.dsh-rsi`) is moved here on first use.
+
+Memory limits (`memory.maxFiles`, `maxTotalBytes`, `maxFileBytes`) are stated in the learning prompts and enforced as the Actor writes; a draft that still ends up over a limit goes back to the same Actor to trim. `/rsi-eval` scores the private `final-candidate/` copy and refuses one whose digest changed after the lineage ended.
 
 ## Remaining differences from RSIAgent
 
@@ -171,10 +183,11 @@ These follow from what dsh provides today; each is stated so nothing claims more
 - **No private writable scratch for a sandboxed Verifier.** dsh's read-only mode has no extra writable root, so the Verifier cannot write even to `/tmp` (as RSIAgent's practice Verifiers). RSIAgent's target Verifier also gets a private `VERIFIER_SCRATCH` tmpfs. Use `rollback` isolation when verification needs writes.
 - **Read hiding and network/process isolation are not mechanical.** dsh confines writes only. File tools refuse Actor-private paths and those paths live outside the workspace and are never disclosed, but a determined `bash` could still read them, reach local services, or signal other processes; RSIAgent uses namespaces.
 - **Interactive Verifier continuity spans one main-agent turn.** dsh hosts wait for children at the turn boundary, so the live context closes there; in a later turn a fresh context continues from its own published reports. Lineage Verifiers persist for the whole attempt.
-- **Evidence leads are `NOT_RUN`.** The harness forwards CLAIM/PROBE pairs but does not execute them; RSIAgent classifies them by running the Actor's validated checks.
+- **Evidence leads are `NOT_RUN`.** The harness forwards CLAIM/PROBE pairs (and nothing else) but does not execute them; RSIAgent classifies them by running the Actor's validated checks.
 - **A memory conflict asks for a new learning phase.** If canonical memory changed after a draft was opened, the draft is discarded and the Actor relearns against current memory; RSIAgent's recovery path refuses instead.
-- **Exploration lineages are not resumable after a restart**; interactive learning phases are.
-- **On dsh 0.2.0-rc.2**, `rsi_explore` is refused (role children cannot start in their own project root) and Verifier isolation is `rollback`.
+- **Exploration lineages are not resumable after a restart**; interactive learning phases are. Drafts of sessions that are never resumed stay on disk until removed by hand.
+- **Forks.** A forked session that inherits an unlearned verdict can learn from it independently of its origin; once either has promoted it, the other is told it is already learned.
+- **On dsh 0.2.0-rc.2**, `rsi_explore` is refused (role children cannot start in their own project root), Verifier isolation is `rollback`, and the interactive tools must be called directly rather than from `run_code` (that version records no structured result for `run_code` sub-calls).
 
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) maps each RSIAgent mechanism to its implementation here.
 
@@ -183,11 +196,11 @@ These follow from what dsh provides today; each is stated so nothing claims more
 ```sh
 pnpm install
 pnpm run typecheck
-pnpm run test     # unit tests, plus real-runtime tests (agent loop, sub-agents, sandbox stack, restart)
+pnpm run test     # unit tests, plus real-runtime tests (agent loop, sub-agents, sandbox stack, restart, guards)
 pnpm run e2e      # offline end-to-end: real dsh headless against scripts/mock-deepseek.mjs
 
 # the 0.2.0-rc.2 line, as CI runs it
-node scripts/use-dsh.mjs 0.2.0-rc.2 && pnpm install --no-frozen-lockfile
+node scripts/use-dsh.mjs 0.2.0-rc.2 && rm pnpm-lock.yaml && pnpm install --no-frozen-lockfile
 pnpm run typecheck:legacy && DSH_LEGACY=1 pnpm run test && DSH_VERSION=0.2.0-rc.2 pnpm run e2e
 ```
 

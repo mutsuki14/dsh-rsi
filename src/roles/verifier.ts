@@ -63,19 +63,31 @@ export interface VerifierCharterInput {
    * context that continues a persistent Verifier role (never Actor material).
    */
   priorReports?: readonly string[]
+  /** `other-verifier`: a fresh context on another model takes over a persistent Verifier role (cross-model swap). */
+  handover?: 'self' | 'other-verifier'
   /** Read-only copy of the inputs the Curriculum originally supplied (Phase 2 practice). */
   originalFixtures?: string
 }
 
 /** Per-inspection message (RSIAgent `agent_harness_verifier_charter`). */
 export function verifierCharter(input: VerifierCharterInput): string {
-  const continuity = input.generation > 1
-    ? `This is candidate generation ${input.generation}. Your context persists while the Actor revises the
+  const continuity = input.generation <= 1
+    ? 'This is candidate generation 1.'
+    : input.handover === 'other-verifier'
+      ? `This is candidate generation ${input.generation}. You are a fresh Verifier context on a different model:
+earlier generations were inspected by another Verifier context. Inspect the current live candidate
+independently; earlier reports, when shown, are evidence to check, not conclusions to inherit.`
+      : `This is candidate generation ${input.generation}. Your context persists while the Actor revises the
 candidate after a FAIL or UNVERIFIED. Each inspection concerns the current live candidate, so prior evidence
 remains useful but does not prove that a later revision is correct.`
-    : 'This is candidate generation 1.'
   const prior = input.priorReports && input.priorReports.length > 0
-    ? `
+    ? input.handover === 'other-verifier'
+      ? `
+
+PUBLISHED REPORTS OF THE EARLIER VERIFIER CONTEXT — verbatim, oldest first:
+${input.priorReports.map((report, index) => `--- report ${index + 1} ---\n${report.trim()}`).join('\n')}
+---`
+      : `
 
 YOUR PRIOR PUBLISHED REPORTS ON EARLIER GENERATIONS — yours, verbatim, oldest first (your earlier context
 ended at a turn boundary; these reports are what it published):

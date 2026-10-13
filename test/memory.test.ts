@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readdir, readFile, rename, symlink, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readdir, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { beforeEach, describe, expect, it } from 'vitest'
@@ -68,10 +68,16 @@ describe('MemoryStore', () => {
     await expect(store.commit(b, { kind: 'practice', outcome: 'PASS' })).rejects.toBeInstanceOf(MemoryConflictError)
   })
 
-  it('enforces limits', async () => {
+  it('enforces limits while the Actor writes, and again at commit', async () => {
     const draft = await store.openDraft('big')
     await expect(store.writeDraft(draft, 'big.md', 'x'.repeat(2048))).rejects.toThrow(/limit/)
-    for (let i = 0; i < 9; i++) await store.writeDraft(draft, `f${i}.md`, 'x')
+    for (let i = 0; i < 8; i++) await store.writeDraft(draft, `f${i}.md`, 'x')
+    // The ninth file is refused at write time, so the Actor can trim within its own learning turn.
+    await expect(store.writeDraft(draft, 'f8.md', 'x')).rejects.toThrow(/9 files; the limit is 8/)
+    // Replacing an existing file does not add to the count.
+    await store.writeDraft(draft, 'f0.md', 'y')
+    // A draft that grew outside the tools is still refused at commit.
+    await writeFile(join(draft.dir, 'f9.md'), 'x')
     await expect(store.commit(draft, { kind: 'practice', outcome: 'PASS' })).rejects.toThrow(/files/)
   })
 
@@ -193,4 +199,119 @@ describe('MemoryStore durability', () => {
     await new MemoryStore(root, limits, { keepHistory: false }).init()
     expect(await readdir(join(root, 'drafts'))).toEqual([])
   })
+
+  it('finishes an install whose tree reached canonical before its journal record (crash recovery)', async () => {
+    const store = new MemoryStore(root, limits, { keepHistory: true })
+    await store.init()
+    const draft = await store.openDraft('task-s-3')
+    await store.writeDraft(draft, 'lesson.md', 'promoted once')
+    const record = await store.commit(draft, { kind: 'task', outcome: 'PASS' })
+    // Recreate the crash window: tree installed, marker present, journal and history not yet written, draft kept.
+    await writeFile(join(root, 'commit.pending.json'), `${JSON.stringify({ v: 1, record })}\n`)
+    await writeFile(join(root, 'journal.jsonl'), '')
+    await rm(join(root, 'history'), { recursive: true, force: true })
+    await mkdir(join(root, 'drafts', 'task-s-3'), { recursive: true })
+    await writeFile(join(root, 'drafts', 'task-s-3', 'lesson.md'), 'promoted once')
+    await writeFile(join(root, 'drafts', 'task-s-3.json'), JSON.stringify({ v: 1, episode: 'task-s-3', baseHash: record.treeBefore, baseManifest: {}, createdAt: '' }))
+    const restarted = new MemoryStore(root, limits, { keepHistory: true })
+    await restarted.init()
+    // The promotion is recognized, so a relearn finds the commit instead of conflicting and promoting twice.
+    expect(await restarted.findCommit('task-s-3')).toMatchObject({ treeAfter: record.treeAfter })
+    expect(await restarted.reopenDraft('task-s-3')).toBeUndefined()
+    expect(await readdir(join(root, 'history'))).toEqual(['0001'])
+    expect((await readdir(root)).includes('commit.pending.json')).toBe(false)
+  })
+
+  it('drops a pending commit whose install never happened', async () => {
+    const store = new MemoryStore(root, limits, { keepHistory: false })
+    await store.init()
+    const draft = await store.openDraft('never')
+    await store.writeDraft(draft, 'x.md', 'x')
+    const treeBefore = await store.treeHash()
+    await writeFile(join(root, 'commit.pending.json'), JSON.stringify({ v: 1, record: { episode: 'never', treeBefore, treeAfter: 'f'.repeat(64) } }))
+    const restarted = new MemoryStore(root, limits, { keepHistory: false })
+    await restarted.init()
+    expect(await restarted.journal()).toEqual([])
+    expect(await restarted.reopenDraft('never')).toBeDefined()
+  })
+
+  it('never reopens a half-discarded or half-opened draft', async () => {
+    const store = new MemoryStore(root, limits, { keepHistory: false })
+    await store.init()
+    const draft = await store.openDraft('half')
+    await store.writeDraft(draft, 'x.md', 'x')
+    // A discard that crashed after removing the metadata (removed first) leaves only a directory.
+    await rm(join(root, 'drafts', 'half.json'))
+    const restarted = new MemoryStore(root, limits, { keepHistory: false })
+    await restarted.init()
+    expect(await restarted.reopenDraft('half')).toBeUndefined()
+    expect(await readdir(join(root, 'drafts'))).toEqual([])
+  })
+
+  it('keeps a record appended after a torn journal tail', async () => {
+    const store = new MemoryStore(root, limits, { keepHistory: false })
+    await store.init()
+    await writeFile(join(root, 'journal.jsonl'), '{"episode":"tor')
+    const draft = await store.openDraft('after')
+    await store.writeDraft(draft, 'a.md', 'a')
+    await store.commit(draft, { kind: 'practice', outcome: 'PASS' })
+    expect((await store.journal()).map(record => record.episode)).toEqual(['after'])
+  })
+
+  it('records a quarantine durably and treats configured freezing like the marker', async () => {
+    const audited = new MemoryStore(root, limits, {
+      keepHistory: false,
+      audit: new LeakageAudit(['the held out task asks for exactly seven red widgets on the second sheet'], 8),
+    })
+    await audited.init()
+    const draft = await audited.openDraft('leak')
+    await audited.writeDraft(draft, 'cheat.md', 'Remember: the held out task asks for exactly seven red widgets!')
+    await expect(audited.commit(draft, { kind: 'practice', outcome: 'PASS' })).rejects.toBeInstanceOf(MemoryQuarantineError)
+    expect(await new MemoryStore(root, limits, { keepHistory: false }).isQuarantined('leak')).toBe(true)
+
+    const frozen = new MemoryStore(root, limits, { keepHistory: false, frozen: true })
+    await frozen.init()
+    expect(await frozen.frozen()).toBe(true)
+    await expect(frozen.openDraft('late')).rejects.toBeInstanceOf(MemoryFrozenError)
+  })
+
+  it('serializes mutations across store instances and takes over a dead owner\'s lock', async () => {
+    const a = new MemoryStore(root, limits, { keepHistory: false })
+    const b = new MemoryStore(root, limits, { keepHistory: false })
+    await a.init()
+    await b.init()
+    const da = await a.openDraft('a')
+    await a.writeDraft(da, 'a.md', 'a')
+    const db = await b.openDraft('b')
+    await b.writeDraft(db, 'b.md', 'b')
+    const results = await Promise.allSettled([a.commit(da, { kind: 'practice', outcome: 'PASS' }), b.commit(db, { kind: 'practice', outcome: 'PASS' })])
+    // Exactly one promotes; the other sees the changed base and conflicts instead of interleaving installs.
+    expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1)
+    expect((results.find(result => result.status === 'rejected') as PromiseRejectedResult).reason).toBeInstanceOf(MemoryConflictError)
+    const { hostname } = await import('node:os')
+    await writeFile(join(root, '.lock'), JSON.stringify({ pid: 2 ** 22 + 12345, host: hostname(), at: '' }))
+    const dc = await a.openDraft('c')
+    expect(dc.episode).toBe('c')
+  })
+
+
+  it('moves dsh-rsi 0.1 memory out of the workspace once, leaving a note', async () => {
+    const { migrateLegacyMemory } = await import('../src/host/stores.ts')
+    const legacy = join(root, 'project', '.dsh-rsi')
+    await mkdir(join(legacy, 'memory', 'procedures'), { recursive: true })
+    await writeFile(join(legacy, 'memory', 'procedures', 'build.md'), 'make build')
+    await writeFile(join(legacy, 'journal.jsonl'), '{"episode":"old"}\n')
+    await mkdir(join(legacy, 'drafts', 'x'), { recursive: true })
+    const target = join(root, 'home', 'rsi', 'project-abc')
+    await migrateLegacyMemory(legacy, target)
+    expect(await readFile(join(target, 'memory', 'procedures', 'build.md'), 'utf8')).toBe('make build')
+    expect(await readFile(join(target, 'journal.jsonl'), 'utf8')).toContain('"old"')
+    expect((await readdir(legacy)).sort()).toEqual(['MOVED.txt'])
+    // A second run is a no-op: the private root already holds memory.
+    await mkdir(join(legacy, 'memory'), { recursive: true })
+    await writeFile(join(legacy, 'memory', 'stale.md'), 'stale')
+    await migrateLegacyMemory(legacy, target)
+    expect(await readdir(join(target, 'memory'))).toEqual(['procedures'])
+  })
+
 })

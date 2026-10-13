@@ -152,12 +152,20 @@ STATUS: SUBMIT
 Do not change durable memory during the attempt.`
 }
 
+/** The newest `limit` characters of a chronological log, cut at an entry boundary: the latest state matters most. */
+export function logTail(log: string, limit: number): string {
+  const text = log.trim()
+  if (text.length <= limit) return text
+  const cut = text.indexOf('\n\n', text.length - limit)
+  return `(earlier entries omitted)\n\n${cut < 0 ? text.slice(-limit) : text.slice(cut + 2)}`
+}
+
 /** Fresh-context resume after a stalled attempt that changed files (RSIAgent `handoff_message`). */
 export function resumeHandoffMessage(worklog: string): string {
   const base = 'NOTE: a previous attempt already worked on this task in this same project root and ended without '
     + 'finishing. The root RETAINS all of its progress — your reconnaissance will find existing work; verify what '
     + 'is already correct and build on it instead of redoing it.'
-  return worklog.trim() ? `${base}\n\nThe previous attempt's work log:\n${worklog.trim().slice(0, 12000)}` : base
+  return worklog.trim() ? `${base}\n\nThe previous attempt's work log:\n${logTail(worklog, 12000)}` : base
 }
 
 /** Fresh-context resume after a stalled attempt that changed no files (RSIAgent `pivot_handoff_message`). */
@@ -165,7 +173,7 @@ export function resumePivotMessage(worklog: string): string {
   const base = 'NOTE: a previous attempt on this task in this same project root stalled WITHOUT changing any files — '
     + 'there is no partial work to protect. Choose a MATERIALLY DIFFERENT strategy from the one it used (different '
     + 'tool, entry point, or method); do not re-run the failed approach unchanged.'
-  return worklog.trim() ? `${base}\n\nIts work log (facts it discovered remain true):\n${worklog.trim().slice(0, 6000)}` : base
+  return worklog.trim() ? `${base}\n\nIts work log (facts it discovered remain true):\n${logTail(worklog, 6000)}` : base
 }
 
 /** RSIAgent `_continuation_after_transport`, for a handoff that arrived but cannot be used. */
@@ -186,6 +194,20 @@ The previous segment ended without your terminal handoff. This was not treated a
 convergence, or learning failure. Continue your current phase in this same context and deliver the complete
 terminal handoff by calling rsi_handoff. If your last reply already was that complete handoff, call
 rsi_handoff with exactly that text.`
+}
+
+/** A stop after a step that ran tools: the turn hit its output limit earlier, nothing stalled. */
+export function toolStepContinuation(): string {
+  return 'Continue your current phase. When it is complete, deliver the terminal handoff by calling rsi_handoff.'
+}
+
+/** The previous reply was cut off at the output limit before its tool calls ran. */
+export function truncatedContinuation(): string {
+  return `SAME-CONTEXT CONTINUATION.
+
+Your previous reply was cut off at the output limit before its tool calls ran; nothing it requested was
+executed. Continue your current phase in this same context, keeping each tool call and each report smaller,
+and deliver the complete terminal handoff by calling rsi_handoff.`
 }
 
 /** Feedback after a Verifier FAIL (RSIAgent `disagreement_message`). */
@@ -222,13 +244,26 @@ strengthen the work first.`
 export function leadsRequest(): string {
   return `Then call rsi_handoff with a new handoff whose first non-empty line is STATUS: SUBMIT, followed by one
 block per unconfirmed requirement:
-CLAIM: <the requirement the probe demonstrates>
-PROBE: <one exact read-only shell command the Verifier can re-run; it must print PASS only when the claim holds>
-Only these CLAIM/PROBE pairs reach the Verifier; any other text in the handoff is not forwarded.`
+CLAIM: <the requirement the probe demonstrates, on one line>
+PROBE: <one exact read-only shell command on one line; the Verifier can re-run it and it prints PASS only when the claim holds>
+A probe that needs several lines goes in a fenced code block right after an empty PROBE: line. Only these
+CLAIM/PROBE pairs reach the Verifier; any other text in the handoff is not forwarded.`
 }
 
 /** Terminal learning turn in the same Actor context (RSIAgent `charter.py:1164`). */
-export function distillationMessage(outcome: 'PASS' | 'FAIL', report: string, promotion: 'engine' | 'actor'): string {
+export interface MemoryLimitsText {
+  maxFiles: number
+  maxTotalBytes: number
+  maxFileBytes: number
+}
+
+function limitsSentence(limits: MemoryLimitsText | undefined): string {
+  return limits === undefined
+    ? 'there is no required schema, length, or number of files'
+    : `there is no required schema; the store's only limits are ${limits.maxFiles} files, ${limits.maxTotalBytes} bytes in total, and ${limits.maxFileBytes} bytes per file`
+}
+
+export function distillationMessage(outcome: 'PASS' | 'FAIL', report: string, promotion: 'engine' | 'actor', limits?: MemoryLimitsText): string {
   const meaning = outcome === 'PASS'
     ? 'The Verifier Agent has verified the complete task.'
     : 'The Verifier Agent returned FAIL; no success was verified.'
@@ -249,8 +284,7 @@ support them, and preserve uncertainty where they do not.
 Update durable memory with rsi_memory_write and rsi_memory_delete (rsi_memory_list, rsi_memory_read and
 rsi_memory_search show the draft) in whatever way will make a fresh future agent more capable in this
 environment: procedures, reusable scripts, environment facts, failure lessons. You may add, revise,
-reorganize, delete, or leave memory unchanged. You own the content, representation, and scope; there is no
-required schema, length, or number of files. A FAIL may still contain valuable evidence, but must not be
+reorganize, delete, or leave memory unchanged. You own the content, representation, and scope; ${limitsSentence(limits)}. A FAIL may still contain valuable evidence, but must not be
 recorded as a verified success. Do not continue changing the task for credit. Never store secrets.
 ${promotion === 'actor' ? 'Call rsi_memory_commit when the draft is ready.' : 'Call rsi_handoff when the draft is ready.'}`
 }

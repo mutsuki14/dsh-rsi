@@ -15,15 +15,20 @@ export class FakeRuntime implements RoleRuntime {
   async open(options: OpenRoleOptions): Promise<RoleConversation> {
     this.opened.push(options)
     let turn = 0
+    let closed = false
     return {
       send: async message => {
+        if (closed) throw new Error(`${options.label}: send after close`)
         const raw = await this.scripts[options.role](message, options, turn++)
         // A scripted reply counts as one tool action unless it says otherwise.
         const reply = typeof raw === 'string' ? { text: raw, actions: 1 } : raw
         this.transcript.push({ label: options.label, message, reply: reply.text })
         return reply
       },
+      // Idempotent, like a real role context: closing twice counts once.
       close: async () => {
+        if (closed) return
+        closed = true
         this.closed++
       },
     }

@@ -1,4 +1,5 @@
-import { cp, lstat, mkdir, readdir, readFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { cp, lstat, mkdir, readdir, readFile, readlink } from 'node:fs/promises'
 import { join, relative, sep } from 'node:path'
 import { sha256 } from '../memory/hash.ts'
 import { diffManifests, type Manifest } from '../memory/store.ts'
@@ -35,6 +36,42 @@ export async function projectManifest(root: string, maxFiles = 5000): Promise<Ma
   return manifest
 }
 
+/**
+ * Digest of everything under `root` — every file, link, and directory, with
+ * modes, including `.git`, dependency trees, and caches — so a Verifier effect
+ * anywhere in the candidate is detected. No ignore list and no cap: this is the
+ * integrity check, not the Verifier's summary.
+ */
+export async function treeFingerprint(root: string): Promise<string> {
+  const hash = createHash('sha256')
+  const visit = async (dir: string): Promise<void> => {
+    let entries
+    try {
+      entries = await readdir(dir, { withFileTypes: true })
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+      throw error
+    }
+    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+    for (const entry of entries) {
+      const full = join(dir, entry.name)
+      const rel = relative(root, full).split(sep).join('/')
+      const info = await lstat(full)
+      if (entry.isSymbolicLink()) hash.update(`L\0${rel}\0${await readlink(full)}\0`)
+      else if (entry.isDirectory()) {
+        hash.update(`D\0${rel}\0${info.mode}\0`)
+        await visit(full)
+      } else if (entry.isFile()) {
+        hash.update(`F\0${rel}\0${info.mode}\0${info.size}\0`)
+        hash.update(await readFile(full))
+        hash.update('\0')
+      } else hash.update(`O\0${rel}\0${info.mode}\0`)
+    }
+  }
+  await visit(root)
+  return hash.digest('hex')
+}
+
 /** Harness-captured facts about candidate changes (RSIAgent `_surface_delta`). Not a grade. */
 export function describeDelta(root: string, before: Manifest, after: Manifest): string {
   const delta = diffManifests(before, after)
@@ -52,8 +89,8 @@ export function describeDelta(root: string, before: Manifest, after: Manifest): 
   return lines.join('\n')
 }
 
-/** A discardable copy for the Verifier, so its effects never reach the candidate. */
+/** A complete copy (links verbatim, timestamps kept) that can restore the candidate exactly. */
 export async function discardableCopy(from: string, to: string): Promise<void> {
   await mkdir(to, { recursive: true })
-  await cp(from, to, { recursive: true })
+  await cp(from, to, { recursive: true, preserveTimestamps: true, verbatimSymlinks: true })
 }

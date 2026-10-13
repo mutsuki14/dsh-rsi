@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process'
 import { cp, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { treeFingerprint } from '../engine/workspace.ts'
 import type { MemoryStore } from '../memory/store.ts'
 
 export interface SealedEvaluationConfig {
@@ -67,8 +68,13 @@ export async function runSealedEvaluation(input: {
   store: MemoryStore
   config: SealedEvaluationConfig
 }): Promise<SealedRecord> {
-  const result = JSON.parse(await readFile(join(input.lineageDir, 'result.json'), 'utf8')) as { candidateRoot?: unknown, termination?: unknown }
+  const result = JSON.parse(await readFile(join(input.lineageDir, 'result.json'), 'utf8')) as { candidateRoot?: unknown, candidateCopy?: unknown, candidateDigest?: unknown }
   if (typeof result.candidateRoot !== 'string') throw new Error(`lineage ${input.lineage} has no final target candidate to evaluate (only completed deep lineages do)`)
+  // Measure the candidate exactly as the lineage ended: the private copy, checked against its recorded digest.
+  const source = typeof result.candidateCopy === 'string' ? result.candidateCopy : result.candidateRoot
+  if (typeof result.candidateDigest === 'string' && (await treeFingerprint(source)) !== result.candidateDigest) {
+    throw new Error(`the final candidate of ${input.lineage} changed after the lineage ended; refusing to score it`)
+  }
   const meta = JSON.parse(await readFile(join(input.lineageDir, 'lineage.json'), 'utf8')) as { target?: unknown }
   if (!(await input.store.isFrozen())) await input.store.freeze()
   await input.store.assertFrozenIntact()
@@ -77,7 +83,7 @@ export async function runSealedEvaluation(input: {
   const runDir = join(input.resultsDir, input.lineage, input.runId)
   const candidate = join(runDir, 'candidate')
   await mkdir(runDir, { recursive: true })
-  await cp(result.candidateRoot, candidate, { recursive: true, preserveTimestamps: true, verbatimSymlinks: true })
+  await cp(source, candidate, { recursive: true, preserveTimestamps: true, verbatimSymlinks: true })
   const taskFile = join(runDir, 'task.md')
   await writeFile(taskFile, typeof meta.target === 'string' ? meta.target : '')
 

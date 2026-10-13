@@ -15,22 +15,62 @@ export interface IsolationDecision {
   unavailable?: string
 }
 
+interface SandboxProbe {
+  confine(argv: readonly string[], policy: { mode: 'read-only', workspaceRoot: string }, signal?: AbortSignal): Promise<{ argv: readonly string[] }>
+}
+
 /**
  * The Verifier's effect isolation on this host. `sandbox` pins the Verifier
  * child to dsh's read-only policy before its first step, which confines its file
  * tools and processes (bash, background jobs, terminals, run_code) while the
- * Actor keeps its own policy. That needs a sandbox-policy service and a reserved
- * child id (so the creation hook can recognize the child).
+ * Actor keeps its own policy. That needs a sandbox-policy service, a reserved
+ * child id (so the creation hook can recognize the child), and a sandbox
+ * backend that actually confines: a profile that runs unconfined (no bwrap or
+ * Landlock) would leave the Verifier unable to run any command, so its verdicts
+ * would measure the host rather than the candidate.
  */
-export function decideIsolation(ctx: Context, setting: IsolationSetting, canReserveIds: boolean): IsolationDecision {
-  const unavailable = !canReserveIds
+export async function decideIsolation(ctx: Context, setting: IsolationSetting, canReserveIds: boolean, cwd: string): Promise<IsolationDecision> {
+  if (setting === 'rollback') return { mode: 'rollback' }
+  let unavailable = !canReserveIds
     ? 'this dsh version cannot reserve sub-agent ids, so the Verifier cannot be confined at creation'
     : ctx.get('sandboxPolicy') === undefined
       ? 'this profile mounts no sandbox-policy service'
       : undefined
-  if (setting === 'rollback') return { mode: 'rollback' }
+  if (unavailable === undefined) {
+    const sandbox = (ctx as unknown as { get(name: string): unknown }).get('sandbox') as SandboxProbe | undefined
+    if (sandbox === undefined) unavailable = 'this profile mounts no sandbox provider'
+    else {
+      try {
+        await sandbox.confine(['true'], { mode: 'read-only', workspaceRoot: cwd })
+      } catch (error) {
+        unavailable = `no sandbox backend can confine a read-only command on this host (${error instanceof Error ? error.message : String(error)})`
+      }
+    }
+  }
   if (unavailable === undefined) return { mode: 'sandbox' }
   return setting === 'sandbox' ? { mode: 'sandbox', unavailable } : { mode: 'rollback', unavailable }
+}
+
+/**
+ * Resolves a path the way the filesystem does: `..` after a symbolic link
+ * means the parent of the link's target, so the deepest existing prefix of the
+ * unnormalized spelling is resolved physically before the missing tail is
+ * re-appended (which cannot contain links, since it does not exist).
+ */
+export function physicalPath(cwd: string, raw: string): string {
+  const spelled = isAbsolute(raw) ? raw : `${cwd}${sep}${raw}`
+  const segments = spelled.split(sep)
+  for (let keep = segments.length; keep > 0; keep--) {
+    const prefix = segments.slice(0, keep).join(sep) || sep
+    try {
+      const real = realpathSync.native(prefix)
+      const rest = segments.slice(keep).filter(segment => segment !== '')
+      return rest.length === 0 ? real : resolve(real, ...rest)
+    } catch {
+      // Missing or unreadable: try a shorter prefix.
+    }
+  }
+  return resolve(spelled)
 }
 
 /** Resolves the deepest existing ancestor with symlinks expanded, then re-appends the missing tail. */
@@ -62,8 +102,15 @@ const PATH_ARGUMENTS: Record<string, 'file_path' | 'path'> = {
   read_image: 'file_path',
   write: 'file_path',
   edit: 'file_path',
+  str_replace_editor: 'path',
   grep: 'path',
   glob: 'path',
+}
+
+export interface GuardedExecution {
+  readonly name: string
+  readonly arguments: unknown
+  readonly agent?: Agent
 }
 
 /**
@@ -75,7 +122,7 @@ const PATH_ARGUMENTS: Record<string, 'file_path' | 'path'> = {
 export function privatePathGuard(
   hidden: readonly string[],
   cwdOf: (session: Session) => string,
-): (execution: { readonly name: string, readonly arguments: unknown, readonly agent?: Agent }) => string | undefined {
+): (execution: GuardedExecution) => string | undefined {
   const roots = hidden.map(path => canonical(resolve(path)))
   return execution => {
     const field = PATH_ARGUMENTS[execution.name]
@@ -83,7 +130,7 @@ export function privatePathGuard(
     const args = (execution.arguments ?? {}) as Record<string, unknown>
     const cwd = execution.agent ? cwdOf(execution.agent.session) : process.cwd()
     const raw = args[field]
-    const target = canonical(resolve(cwd, typeof raw === 'string' && raw.trim() !== '' ? raw : '.'))
+    const target = physicalPath(cwd, typeof raw === 'string' && raw.trim() !== '' ? raw : '.')
     const searches = execution.name === 'grep' || execution.name === 'glob'
     for (const root of roots) {
       if (within(target, root) || (searches && within(root, target))) {
@@ -95,11 +142,12 @@ export function privatePathGuard(
 }
 
 /**
- * Applies a role's isolation from the serial `agent/created` hook, before the
- * child's first step: the read-only sandbox mode is an ordinary `sandbox/mode`
- * session event on the child alone, and the guard is scoped to the child's context.
+ * Applies a role's sandbox pin from the serial `agent/created` hook, before
+ * the child's first step: the read-only sandbox mode is an ordinary
+ * `sandbox/mode` session event on the child alone. Tool guards are global and
+ * keyed by role (see the plugin), so they also cover hosts where the child's
+ * id is only known after creation.
  */
-export function applyRoleIsolation(agent: Agent, role: RoleContext, cwdOf: (session: Session) => string): void {
+export function applyRoleIsolation(agent: Agent, role: RoleContext): void {
   if (role.readOnly) agent.session.append('sandbox/mode', { mode: 'read-only' })
-  if (role.hidden.length > 0) agent.ctx.tools.guard(privatePathGuard(role.hidden, cwdOf))
 }

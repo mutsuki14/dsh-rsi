@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { cp, lstat, mkdir, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, isAbsolute, join, resolve } from 'node:path'
 import type { Agent } from '@deepseek-ai/dsh-agent'
@@ -20,8 +21,10 @@ export function dshHome(): string {
  * - The memory root (canonical memory, drafts, journal, reports, lineage
  *   records) lives outside the project by default, like RSIAgent's host-side
  *   memory, so candidates, diffs, and Verifier file tools never contain it.
- * - The workspace state root holds only what roles must work in: practice and
- *   target project roots and fixture authoring roots.
+ * - The work root holds only what roles must work in: practice and target
+ *   project roots and fixture authoring roots. It also lives outside the
+ *   project by default, so role commands such as `git` never act on the
+ *   user's repository.
  */
 export class StoreRegistry {
   readonly #stores = new Map<string, Promise<MemoryStore>>()
@@ -36,29 +39,35 @@ export class StoreRegistry {
     return agent.session.header.cwd ?? process.cwd()
   }
 
-  /** Workspace-visible state root (lineage project roots). */
+  /** Role-visible work root (lineage project roots). */
   stateRoot(projectDir: string): string {
-    return isAbsolute(this.config.stateDir) ? this.config.stateDir : resolve(projectDir, this.config.stateDir)
+    const configured = this.config.stateDir.trim()
+    if (configured) return isAbsolute(configured) ? configured : resolve(projectDir, configured)
+    return join(dshHome(), 'rsi-work', projectKey(projectDir))
   }
 
   /** Harness-private memory root. */
   memoryRoot(projectDir: string): string {
     const configured = this.config.memoryDir.trim()
     if (configured) return isAbsolute(configured) ? configured : resolve(projectDir, configured)
-    const key = createHash('sha256').update(resolve(projectDir)).digest('hex').slice(0, 12)
-    const name = basename(resolve(projectDir)).replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 40) || 'root'
-    return join(dshHome(), 'rsi', `${name}-${key}`)
+    return join(dshHome(), 'rsi', projectKey(projectDir))
   }
 
   forAgent(agent: Agent): Promise<MemoryStore> {
-    return this.forRoot(this.memoryRoot(this.projectDir(agent)))
+    const projectDir = this.projectDir(agent)
+    const root = this.memoryRoot(projectDir)
+    return this.forRoot(root, this.config.memoryDir.trim() === '' ? () => migrateLegacyMemory(resolve(projectDir, '.dsh-rsi'), root) : undefined)
   }
 
-  forRoot(root: string): Promise<MemoryStore> {
+  forRoot(root: string, prepare?: () => Promise<void>): Promise<MemoryStore> {
     let store = this.#stores.get(root)
     if (!store) {
-      const created = new MemoryStore(root, this.config.memory, { keepHistory: this.config.memory.keepHistory, audit: this.#audit })
-      store = created.init().then(async () => {
+      const created = new MemoryStore(root, this.config.memory, {
+        keepHistory: this.config.memory.keepHistory,
+        audit: this.#audit,
+        frozen: this.config.mode === 'frozen',
+      })
+      store = (prepare ? prepare() : Promise.resolve()).then(() => created.init()).then(async () => {
         await this.refresh(created)
         return created
       })
@@ -77,4 +86,45 @@ export class StoreRegistry {
   inventory(root: string): Array<{ path: string, bytes: number }> | undefined {
     return this.#inventories.get(root)
   }
+}
+
+/** `<basename>-<sha12>` of a project directory: readable and collision-free. */
+export function projectKey(projectDir: string): string {
+  const key = createHash('sha256').update(resolve(projectDir)).digest('hex').slice(0, 12)
+  const name = basename(resolve(projectDir)).replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 40) || 'root'
+  return `${name}-${key}`
+}
+
+const LEGACY_ENTRIES = ['memory', 'journal.jsonl', 'history', 'frozen.json', 'reports']
+
+async function exists(path: string): Promise<boolean> {
+  return lstat(path).then(() => true, () => false)
+}
+
+/**
+ * dsh-rsi 0.1 kept memory inside the workspace (`<project>/.dsh-rsi`). Moves it
+ * to the private root once, when that root holds no memory yet, so an upgrade
+ * neither starts from empty memory nor leaves the old copy where a Verifier
+ * could read it.
+ */
+export async function migrateLegacyMemory(legacy: string, root: string): Promise<void> {
+  if (!(await exists(join(legacy, 'journal.jsonl'))) && !(await exists(join(legacy, 'memory')))) return
+  if (await exists(join(root, 'journal.jsonl'))) return
+  if ((await exists(join(root, 'memory'))) && (await readdir(join(root, 'memory'))).length > 0) return
+  await mkdir(root, { recursive: true })
+  for (const entry of LEGACY_ENTRIES) {
+    const from = join(legacy, entry)
+    if (!(await exists(from))) continue
+    const to = join(root, entry)
+    await rm(to, { recursive: true, force: true })
+    try {
+      await rename(from, to)
+    } catch {
+      // Different filesystems: copy, then remove the workspace copy.
+      await cp(from, to, { recursive: true, verbatimSymlinks: true })
+      await rm(from, { recursive: true, force: true })
+    }
+  }
+  await rm(join(legacy, 'drafts'), { recursive: true, force: true })
+  await writeFile(join(legacy, 'MOVED.txt'), `dsh-rsi memory moved to ${root}\n`, 'utf8')
 }

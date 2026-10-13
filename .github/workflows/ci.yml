@@ -10,7 +10,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        dsh: ['0.2.1-alpha.2', '0.2.0-rc.2']
+        # Explicit per-leg values: an `a && '' || 'b'` expression yields 'b' even when `a` holds.
+        include:
+          - dsh: '0.2.1-alpha.2'
+            legacy: ''
+            typecheck: typecheck
+          - dsh: '0.2.0-rc.2'
+            legacy: '1'
+            typecheck: 'typecheck:legacy'
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -27,13 +34,15 @@ jobs:
         if: matrix.dsh != '0.2.1-alpha.2'
         run: |
           node scripts/use-dsh.mjs ${{ matrix.dsh }}
+          # Resolve from scratch: the committed lockfile would keep alpha transitive packages in the rc graph.
+          rm pnpm-lock.yaml
           pnpm install --no-frozen-lockfile
       - name: Typecheck
-        run: ${{ matrix.dsh == '0.2.1-alpha.2' && 'pnpm run typecheck' || 'pnpm run typecheck:legacy' }}
+        run: pnpm run ${{ matrix.typecheck }}
       - name: Unit and real-runtime tests
         run: pnpm run test
         env:
-          DSH_LEGACY: ${{ matrix.dsh == '0.2.1-alpha.2' && '' || '1' }}
+          DSH_LEGACY: ${{ matrix.legacy }}
       - name: Offline dsh headless end-to-end
         run: pnpm run e2e
         env:

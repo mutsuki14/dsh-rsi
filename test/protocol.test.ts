@@ -68,12 +68,31 @@ describe('parseSubmitHandoff', () => {
 })
 
 describe('leads', () => {
-  it('extracts CLAIM/PROBE pairs with multi-line probes and drops narrative', () => {
-    const handoff = 'STATUS: SUBMIT\nI am confident.\nCLAIM: output exists\nPROBE: test -f out.txt && echo PASS\nCLAIM: two lines\nPROBE: python3 - <<PY\nprint("PASS")\nPY\nCLAIM: no probe'
+  it('extracts CLAIM/PROBE pairs with fenced multi-line probes and drops all narrative', () => {
+    const handoff = [
+      'STATUS: SUBMIT',
+      'I am confident.',
+      'CLAIM: output exists',
+      'PROBE: test -f out.txt && echo PASS',
+      'This line explains my work and must not reach the Verifier.',
+      'CLAIM: two lines',
+      'PROBE:',
+      '```sh',
+      'python3 - <<PY',
+      'print("PASS")',
+      'PY',
+      '```',
+      'CLAIM: no probe',
+      '',
+      'I fixed parse.py and all my own tests pass; the task is complete.',
+    ].join('\n')
     expect(parseLeads(handoff)).toEqual([
       { claim: 'output exists', probe: 'test -f out.txt && echo PASS' },
       { claim: 'two lines', probe: 'python3 - <<PY\nprint("PASS")\nPY' },
     ])
+    // Narrative after the last probe never travels inside it.
+    expect(parseLeads('STATUS: SUBMIT\nCLAIM: sorted\nPROBE: sort -c out.txt && echo PASS\n\nI fixed parse.py; the task is complete.'))
+      .toEqual([{ claim: 'sorted', probe: 'sort -c out.txt && echo PASS' }])
   })
   it('formats RSIAgent LEAD blocks marked NOT_RUN', () => {
     const text = formatLeads([{ claim: 'c', probe: 'p' }])

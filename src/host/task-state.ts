@@ -31,6 +31,8 @@ const learningSchema = z.object({
   stage: z.enum(['distill', 'reconcile']),
   outcome: z.enum(['PASS', 'FAIL']),
   verdictSeq: z.number().int().nonnegative(),
+  /** `turn:step` whose result entered the current stage; the next stage needs a later model step. */
+  stageStep: z.string().nullable().default(null),
 })
 
 export type ReportRef = z.infer<typeof reportRefSchema>
@@ -43,10 +45,14 @@ export const taskStateSchema = z.object({
   reports: z.array(reportRefSchema),
   verdict: verdictSchema.nullable(),
   verdictSeq: z.number().int().nonnegative().nullable(),
+  /** Session that recorded the verdict: a fork learns under the episode its origin would use. */
+  verdictSession: z.string().nullable(),
   requestCount: z.number().int().nonnegative(),
   learning: learningSchema.nullable(),
   /** Verdict whose learning ended terminally (quarantined): no second learning phase for it. */
   closedVerdictSeq: z.number().int().nonnegative().nullable(),
+  /** `turn:step` of the latest model tool call (the step a tool call now executing belongs to). */
+  callStep: z.string().nullable(),
 })
 
 export type TaskState = z.infer<typeof taskStateSchema>
@@ -60,6 +66,7 @@ export const metaSchema = z.discriminatedUnion('op', [
     verdict: verdictSchema,
     requestCount: z.number().int().nonnegative(),
     report: z.object({ sha256: sha256Schema, bytes: z.number().int().nonnegative() }),
+    session: z.string().min(1).optional(),
   }),
   z.object({ rsi: z.literal(1), op: z.literal('learn'), learning: learningSchema }),
   z.object({ rsi: z.literal(1), op: z.literal('reconcile'), episode: z.string().min(1) }),
@@ -77,9 +84,11 @@ export function initTask(header: SessionHeader): TaskState {
     reports: [],
     verdict: null,
     verdictSeq: null,
+    verdictSession: null,
     requestCount: 0,
     learning: null,
     closedVerdictSeq: null,
+    callStep: null,
   }
 }
 
@@ -87,7 +96,7 @@ function isStateTool(name: string): name is StateTool {
   return (STATE_TOOLS as readonly string[]).includes(name)
 }
 
-function settle(state: TaskState, seq: number, rawMeta: unknown): TaskState {
+function settle(state: TaskState, seq: number, rawMeta: unknown, step: string | null): TaskState {
   const parsed = metaSchema.safeParse(rawMeta)
   if (!parsed.success) return state
   const meta = parsed.data
@@ -100,16 +109,17 @@ function settle(state: TaskState, seq: number, rawMeta: unknown): TaskState {
         reports: [...reports, { generation: meta.generation, verdict: meta.verdict, sha256: meta.report.sha256, bytes: meta.report.bytes }],
         verdict: meta.verdict,
         verdictSeq: seq,
+        verdictSession: meta.session ?? null,
         requestCount: meta.requestCount,
       }
     }
     case 'learn':
-      return { ...state, learning: meta.learning }
+      return { ...state, learning: { ...meta.learning, stageStep: step } }
     case 'reconcile':
-      return state.learning?.episode === meta.episode ? { ...state, learning: { ...state.learning, stage: 'reconcile' } } : state
+      return state.learning?.episode === meta.episode ? { ...state, learning: { ...state.learning, stage: 'reconcile', stageStep: step } } : state
     case 'commit':
       // A promoted experience completes the task: the next submission starts a new Verifier lineage.
-      return { ...state, generation: 0, reports: [], verdict: null, verdictSeq: null, learning: null, closedVerdictSeq: null }
+      return { ...state, generation: 0, reports: [], verdict: null, verdictSeq: null, verdictSession: null, learning: null, closedVerdictSeq: null }
     case 'close':
       return {
         ...state,
@@ -127,8 +137,11 @@ function settle(state: TaskState, seq: number, rawMeta: unknown): TaskState {
 export function applyTask(state: TaskState, event: SessionEvent): TaskState {
   if (!state.enabled) return state
   switch (event.type) {
-    case 'tool/call':
-      return isStateTool(event.data.name) ? { ...state, pending: { ...state.pending, [event.data.callId]: event.data.name } } : state
+    case 'tool/call': {
+      const callStep = `${event.data.turn}:${event.data.step}`
+      if (isStateTool(event.data.name)) return { ...state, callStep, pending: { ...state.pending, [event.data.callId]: event.data.name } }
+      return state.callStep === callStep ? state : { ...state, callStep }
+    }
     case 'tool/result': {
       // Compaction re-appends pruned copies as replacements; only the original append settles a call.
       if (event.surfaceOp !== 'append') return state
@@ -136,12 +149,13 @@ export function applyTask(state: TaskState, event: SessionEvent): TaskState {
       if (state.pending[callId] === undefined) return state
       const { [callId]: _settled, ...pending } = state.pending
       const next = { ...state, pending }
-      return event.data.message.isError === true || event.data.meta === undefined ? next : settle(next, event.seq, event.data.meta)
+      return event.data.message.isError === true || event.data.meta === undefined ? next : settle(next, event.seq, event.data.meta, `${event.data.turn}:${event.data.step}`)
     }
     case 'tool/ptc-dispatch': {
       // dsh 0.2.0 records no meta on PTC sub-dispatches; there the fold simply sees none.
       const meta = (event.data as { meta?: unknown }).meta
-      return isStateTool(event.data.name) && !event.data.isError && meta !== undefined ? settle(state, event.seq, meta) : state
+      // A sub-dispatch belongs to the step of its run_code call, the latest model tool call.
+      return isStateTool(event.data.name) && !event.data.isError && meta !== undefined ? settle(state, event.seq, meta, state.callStep) : state
     }
     case 'turn/end':
       return Object.keys(state.pending).length === 0 ? state : { ...state, pending: {} }

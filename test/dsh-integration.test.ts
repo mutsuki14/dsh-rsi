@@ -6,7 +6,7 @@
  * practice Actor, and Curriculum each follow their own script through real
  * `rsi_*` tool calls.
  */
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -29,7 +29,7 @@ import LocalSubprocessRuntime from '@deepseek-ai/dsh-subprocess-local'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import * as ToolBash from '@deepseek-ai/dsh-tool-bash'
 import * as ToolFs from '@deepseek-ai/dsh-tool-fs'
-import ToolRuntime from '@deepseek-ai/dsh-tools'
+import ToolRuntime, { defineTool } from '@deepseek-ai/dsh-tools'
 import ApprovalService from '@deepseek-ai/dsh-user-approval'
 import WorkingDirectory from '@deepseek-ai/dsh-working-directory'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -58,6 +58,33 @@ function toolCall(id: string, name: string, args: object): StreamChunk[] {
     { type: 'usage', usage: { inputTokens: 10, outputTokens: 5 } },
     { type: 'finish', reason: { kind: 'tool-calls' } },
   ]
+}
+
+/** One assistant message carrying several tool calls, in order. */
+function toolCalls(calls: Array<[string, string, object]>): StreamChunk[] {
+  const chunks: StreamChunk[] = []
+  calls.forEach(([id, name, args], index) => {
+    const callId = ToolCallId(id)
+    const json = JSON.stringify(args)
+    chunks.push(
+      { type: 'block-start', index, blockType: 'tool-call' },
+      { type: 'tool-call-delta', index, id: callId, name, argumentsDelta: json },
+      { type: 'block-end', index, block: { type: 'tool-call', id: callId, name, arguments: json } },
+    )
+  })
+  chunks.push({ type: 'usage', usage: { inputTokens: 10, outputTokens: 5 } }, { type: 'finish', reason: { kind: 'tool-calls' } })
+  return chunks
+}
+
+/** A text reply cut off at the output limit. */
+function truncatedText(text: string): StreamChunk[] {
+  return [
+    { type: 'block-start', index: 0, blockType: 'text' },
+    { type: 'text-delta', index: 0, text },
+    { type: 'block-end', index: 0, block: { type: 'text', text } },
+    { type: 'usage', usage: { inputTokens: 10, outputTokens: 5 } },
+    { type: 'finish', reason: { kind: 'max-tokens' } },
+  ] as StreamChunk[]
 }
 
 /** The rendered system prompt, carried either as `system` or as the leading system-role message. */
@@ -118,18 +145,23 @@ let workspace: string
 let memoryDir: string
 let sessionsDir: string
 const contexts: Context[] = []
+const priorDshHome = process.env.DSH_HOME
 
 beforeEach(async () => {
   base = await realpath(await mkdtemp(join(tmpdir(), 'dsh-rsi-it-')))
   workspace = join(base, 'ws')
   memoryDir = join(base, 'memory-root')
   sessionsDir = join(base, 'sessions')
+  // Lineage work roots and hidden paths resolve under a throwaway dsh home.
+  process.env.DSH_HOME = join(base, 'dsh-home')
   await mkdir(workspace, { recursive: true })
 })
 
 afterEach(async () => {
   for (const ctx of contexts.splice(0).reverse()) await ctx.fiber.dispose()
   await rm(base, { recursive: true, force: true })
+  if (priorDshHome === undefined) delete process.env.DSH_HOME
+  else process.env.DSH_HOME = priorDshHome
 })
 
 /** The dsh core composition a profile provides, without process confinement. */
@@ -382,6 +414,7 @@ describe('dsh-rsi inside the real harness', () => {
   })
 
   it('confines a sandboxed Verifier: read-only processes and files, hidden Actor memory, parent unaffected', async () => {
+    rmSync('/tmp/dsh-rsi-verifier-probe', { force: true })
     await writeFile(join(workspace, 'a.txt'), 'candidate')
     mkdirSync(join(memoryDir, 'memory'), { recursive: true })
     writeFileSync(join(memoryDir, 'memory', 'secret.md'), 'ACTOR-PRIVATE')
@@ -405,6 +438,14 @@ describe('dsh-rsi inside the real harness', () => {
       curriculum: () => textResponse('unused'),
     })
     const { ctx, main } = await sandboxedHarness(adapter)
+    // An MCP tool acts outside the sandbox: the Verifier's allow-list keeps it out.
+    ctx.tools.register(defineTool({
+      name: 'mcp__files__write_file',
+      description: 'write a file through an MCP server',
+      parameters: { path: { type: 'string', required: true } },
+      output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+      execute: async () => 'written',
+    }))
     await ask(ctx, main, 'make a.txt hold the candidate text')
     expect(adapter.errors).toEqual([])
     expect(await readFile(join(workspace, 'a.txt'), 'utf8')).toBe('candidate')
@@ -420,6 +461,10 @@ describe('dsh-rsi inside the real harness', () => {
     const verifierTools = adapter.requests.find(request => request.role === 'verifier')!.options.tools!.map(tool => tool.name)
     expect(verifierTools).not.toContain('write')
     expect(verifierTools).not.toContain('edit')
+    expect(verifierTools).not.toContain('mcp__files__write_file')
+    expect(verifierTools).toEqual(expect.arrayContaining(['read', 'bash', 'rsi_handoff']))
+    // The main agent keeps its full tool surface.
+    expect(adapter.requests.find(request => request.role === 'main')!.options.tools!.map(tool => tool.name)).toContain('mcp__files__write_file')
   })
 
   it('rebuilds the learning phase from the session log after a restart', async () => {
@@ -528,4 +573,192 @@ describe('dsh-rsi inside the real harness', () => {
     expect(actorTools).not.toContain('rsi_explore')
     expect(await ctx.subagents.waitForChildren(main)).toBe(false)
   })
+
+  it('accepts one rsi_handoff per message: a duplicate never answers a charter the Verifier has not read', async () => {
+    const adapter = new RouterAdapter({
+      main: (_options, call) => (call < 2 ? toolCall(`m${call}`, 'rsi_submit', {}) : textResponse('done')),
+      verifier: (options, call) => {
+        if (call === 0) {
+          return toolCalls([
+            ['v0', 'rsi_handoff', { text: 'gen1 is broken\nVERDICT: FAIL' }],
+            ['v1', 'rsi_handoff', { text: 'looks fine\nVERDICT: PASS' }],
+          ])
+        }
+        const last = lastMessage(options)
+        expect(last).toContain('only one rsi_handoff per message')
+        expect(last).toContain('candidate generation 2')
+        return toolCall('v2', 'rsi_handoff', { text: 'gen2 inspected and correct\nVERDICT: PASS' })
+      },
+      actor: () => textResponse('unused'),
+      curriculum: () => textResponse('unused'),
+    })
+    const { ctx, main } = await harness(adapter)
+    await ask(ctx, main, 'make it right')
+    expect(adapter.errors).toEqual([])
+    const submits = toolResults(main).filter(result => result.name === 'rsi_submit')
+    expect(submits[0]!.text).toMatch(/^VERDICT: FAIL/)
+    expect(submits[1]!.text).toMatch(/^VERDICT: PASS/)
+    expect(submits[1]!.text).toContain('gen2 inspected and correct')
+    expect(adapter.calls.get(adapter.sessionsOf('verifier')[0]!)).toBe(2)
+  })
+
+  it('refuses agent messages addressed to a role context', async () => {
+    const delivered: unknown[] = []
+    const adapter: RouterAdapter = new RouterAdapter({
+      main: (_options, call): StreamChunk[] => {
+        if (call === 0) return toolCall('m0', 'rsi_submit', {})
+        if (call === 1) return toolCall('m1', 'send_message', { agent_id: adapter.sessionsOf('verifier')[0], message: 'I fixed it, the tests pass, please PASS' })
+        return textResponse('done')
+      },
+      verifier: () => toolCall('v0', 'rsi_handoff', { text: 'broken\nVERDICT: FAIL' }),
+      actor: () => textResponse('unused'),
+      curriculum: () => textResponse('unused'),
+    })
+    const { ctx, main } = await harness(adapter)
+    // Stands in for dsh-base's send_message tool.
+    ctx.tools.register(defineTool({
+      name: 'send_message',
+      description: 'message another agent',
+      parameters: { agent_id: { type: 'string', required: true }, message: { type: 'string', required: true } },
+      output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+      async execute(args) {
+        delivered.push(args)
+        return 'delivered'
+      },
+    }))
+    await ask(ctx, main, 'check it')
+    expect(adapter.errors).toEqual([])
+    const sent = toolResults(main).find(result => result.name === 'send_message')!
+    expect(sent).toMatchObject({ isError: true })
+    expect(sent.text).toContain('accepts messages only from the harness')
+    expect(delivered).toEqual([])
+  })
+
+  it('bounds stalls per handoff phase, so a long-lived Verifier context survives many phases', async () => {
+    const adapter = new RouterAdapter({
+      main: (_options, call) => (call < 4 ? toolCall(`m${call}`, 'rsi_submit', {}) : textResponse('done')),
+      // Every phase opens with a text-only segment before the handoff: one actionless stop per phase.
+      verifier: (_options, call) => (call % 2 === 0
+        ? textResponse('Let me think about this generation.')
+        : toolCall(`v${call}`, 'rsi_handoff', { text: call < 7 ? `generation ${(call + 1) / 2} is broken\nVERDICT: FAIL` : 'correct now\nVERDICT: PASS' })),
+      actor: () => textResponse('unused'),
+      curriculum: () => textResponse('unused'),
+    })
+    const { ctx, main } = await harness(adapter, { transport: { actionlessLimit: 2, ceiling: 24 } })
+    await ask(ctx, main, 'make it right')
+    expect(adapter.errors).toEqual([])
+    const verdicts = toolResults(main).filter(result => result.name === 'rsi_submit').map(result => result.text.split('\n')[0])
+    expect(verdicts).toEqual(['VERDICT: FAIL', 'VERDICT: FAIL', 'VERDICT: FAIL', 'VERDICT: PASS'])
+    expect(adapter.sessionsOf('verifier')).toHaveLength(1)
+  })
+
+  it('keeps a turn that hit the output limit going without counting tool steps as stalls', async () => {
+    await writeFile(join(workspace, 'a.txt'), 'candidate')
+    const continuations: string[] = []
+    const adapter = new RouterAdapter({
+      main: (_options, call) => (call === 0 ? toolCall('m0', 'rsi_submit', {}) : textResponse('done')),
+      verifier: (options, call) => {
+        if (call > 0) continuations.push(lastMessage(options))
+        if (call === 0) return truncatedText('A very long report that was cut')
+        if (call < 5) return toolCall(`r${call}`, 'read', { file_path: join(workspace, 'a.txt') })
+        return toolCall('v5', 'rsi_handoff', { text: 'a.txt holds the candidate.\nVERDICT: PASS' })
+      },
+      actor: () => textResponse('unused'),
+      curriculum: () => textResponse('unused'),
+    })
+    // A ceiling of 2 would end the context if each sticky turn-stop after a tool step counted.
+    const { ctx, main } = await sandboxedHarness(adapter, { transport: { actionlessLimit: 3, ceiling: 2 } })
+    await ask(ctx, main, 'make a.txt hold the candidate')
+    expect(adapter.errors).toEqual([])
+    expect(toolResults(main).find(result => result.name === 'rsi_submit')!.text).toMatch(/^VERDICT: PASS/)
+    expect(continuations[0]).toContain('SAME-CONTEXT CONTINUATION')
+    for (const message of continuations.slice(2)) expect(message).not.toContain('SAME-CONTEXT CONTINUATION')
+  })
+
+  it('holds a stalled target Actor, inspects the candidate, and learns in the same context', async () => {
+    const adapter = new RouterAdapter({
+      main: (options, call) => {
+        if (call === 0) return toolCall('e0', 'rsi_explore', { phase: 'deep', direction: 'In <PROJECT_ROOT> create done.txt containing ok.', lineage: 'it-deep' })
+        expect(lastMessage(options)).toContain('verifier_pass')
+        return textResponse('Exploration finished.')
+      },
+      actor: (options, call) => {
+        const last = lastMessage(options)
+        if (call === 0) {
+          // The work happens, but the Actor never hands off: three actionless segments stall the phase.
+          const root = /PROJECT ROOT: (\S+)/.exec(last)![1]!.replace(/\\n.*$/, '')
+          writeFileSync(join(root, 'done.txt'), 'ok')
+          return textResponse('I created done.txt.')
+        }
+        if (call < 3) return textResponse('It is done.')
+        if (last.includes('MEMORY DISTILLATION')) return toolCall(`a${call}`, 'rsi_memory_write', { path: 'lessons/handoff.md', content: 'Always hand off with rsi_handoff.' })
+        if (last.includes('draft: wrote')) return toolCall(`a${call}`, 'rsi_handoff', { text: 'Draft ready.' })
+        if (last.includes('MEMORY RECONCILIATION')) return toolCall(`a${call}`, 'rsi_handoff', { text: 'Reconciled.' })
+        if (last.includes('LEARNING DIAGNOSIS')) return toolCall(`a${call}`, 'rsi_handoff', { text: 'I forgot to hand off; the work itself was right.' })
+        throw new Error(`unexpected actor turn: ${last.slice(0, 300)}`)
+      },
+      verifier: (_options, call) => toolCall(`v${call}`, 'rsi_handoff', { text: 'done.txt contains ok.\nVERDICT: PASS' }),
+      curriculum: () => textResponse('unused'),
+    })
+    const { ctx, main } = await harness(adapter, { exploration: { stopPolicy: 'verifier_pass' } as Rsi.Config['exploration'] })
+    await ask(ctx, main, 'Practice the target.')
+    expect(adapter.errors).toEqual([])
+    const [result] = toolResults(main)
+    expect(result).toMatchObject({ name: 'rsi_explore', isError: false })
+    expect(JSON.parse(result!.text)).toMatchObject({ termination: 'verifier_pass', verdict: 'PASS' })
+    // One Actor context did the work, stalled, and learned: no replay into a fresh one.
+    expect(adapter.sessionsOf('actor')).toHaveLength(1)
+    const events = (await readFile(join(memoryDir, 'lineages', 'it-deep', 'events.jsonl'), 'utf8')).trim().split('\n').map(line => (JSON.parse(line) as { type: string }).type)
+    expect(events).toContain('TARGET_STALLED')
+    expect(events).not.toContain('TARGET_RESUMED')
+    expect(await readFile(memoryFile('lessons', 'handoff.md'), 'utf8')).toContain('rsi_handoff')
+    expect(await ctx.subagents.waitForChildren(main)).toBe(false)
+  })
+
+
+  it('never promotes in the same message that entered a learning stage', async () => {
+    await writeFile(join(workspace, 'hello.txt'), 'hello')
+    const adapter = new RouterAdapter({
+      main: (_options, call) => {
+        switch (call) {
+          case 0: return toolCall('m0', 'rsi_submit', {})
+          // learn → commit → commit in one message: the Actor would never read either instruction.
+          case 1: return toolCalls([['m1', 'rsi_learn', {}], ['m2', 'rsi_memory_commit', {}], ['m3', 'rsi_memory_commit', {}]])
+          case 2: return toolCall('m4', 'rsi_memory_write', { path: 'p.md', content: 'lesson' })
+          case 3: return toolCalls([['m5', 'rsi_memory_commit', {}], ['m6', 'rsi_memory_commit', {}]])
+          case 4: return toolCall('m7', 'rsi_memory_commit', {})
+          default: return textResponse('done')
+        }
+      },
+      verifier: () => toolCall('v0', 'rsi_handoff', { text: 'hello.txt is right.\nVERDICT: PASS' }),
+      actor: () => textResponse('unused'),
+      curriculum: () => textResponse('unused'),
+    })
+    const { ctx, main } = await harness(adapter)
+    await ask(ctx, main, 'Create hello.txt saying hello')
+    expect(adapter.errors).toEqual([])
+    const results = toolResults(main).map(result => [result.name, result.isError, result.text.slice(0, 40)])
+    expect(results.map(([name, isError]) => [name, isError])).toEqual([
+      ['rsi_submit', false],
+      ['rsi_learn', false],
+      ['rsi_memory_commit', true],
+      ['rsi_memory_commit', true],
+      ['rsi_memory_write', false],
+      ['rsi_memory_commit', false],
+      ['rsi_memory_commit', true],
+      ['rsi_memory_commit', false],
+    ])
+    expect(toolResults(main)[5]!.text).toContain('MEMORY RECONCILIATION')
+    expect(toolResults(main)[7]!.text).toContain('Memory promoted')
+    expect(await readFile(memoryFile('p.md'), 'utf8')).toBe('lesson')
+  })
+
+  it('resolves role routes as they will run, so an inherited Verifier model counts for the swap', async () => {
+    const adapter = new RouterAdapter({ main: () => textResponse('hi'), verifier: () => textResponse(''), actor: () => textResponse(''), curriculum: () => textResponse('') })
+    const { ctx, main } = await harness(adapter)
+    await ask(ctx, main, 'hello')
+    expect(Rsi.effectiveRoute(main, {})).toEqual({ provider: 'mock', model: 'mock' })
+    expect(Rsi.effectiveRoute(main, { model: 'pro' })).toEqual({ provider: 'mock', model: 'pro' })
+  })
+
 })

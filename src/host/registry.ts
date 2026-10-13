@@ -22,10 +22,33 @@ export interface RoleContext {
   sinceHandoff: number
   /** Tool actions since the last turn-stopping continuation. */
   sinceStop: number
-  /** Consecutive segments that ended without any action or handoff. */
+  /** Consecutive segments of the current phase that ended without any action or handoff. */
   actionlessStops: number
-  /** Continuations steered into this context. */
+  /** Continuations steered into the current phase. */
   stops: number
+  /** `turn:step` of the step the child is in, from its own session log. */
+  stepKey: string
+  /** Tool calls the current step dispatched. */
+  stepToolCalls: number
+  /** Tool-call blocks in the current step's assistant message (more than dispatched: truncated). */
+  stepToolBlocks: number
+  /** Text of the child's latest assistant message. */
+  lastText: string
+  /** Step whose rsi_handoff was accepted last: one handoff per model step. */
+  handoffStep: string | undefined
+}
+
+/** The per-step and per-phase counters of a fresh context. */
+export function freshCounters(): Pick<RoleContext, 'sinceHandoff' | 'sinceStop' | 'actionlessStops' | 'stops' | 'stepKey' | 'stepToolCalls' | 'stepToolBlocks' | 'lastText' | 'handoffStep'> {
+  return { sinceHandoff: 0, sinceStop: 0, actionlessStops: 0, stops: 0, stepKey: '', stepToolCalls: 0, stepToolBlocks: 0, lastText: '', handoffStep: undefined }
+}
+
+/** A new handoff phase: both transport bounds apply per phase, as in RSIAgent `_run_handoff_phase`. */
+export function startPhase(role: RoleContext): void {
+  role.sinceHandoff = 0
+  role.sinceStop = 0
+  role.actionlessStops = 0
+  role.stops = 0
 }
 
 /**
@@ -35,11 +58,13 @@ export interface RoleContext {
  *
  * On dsh hosts without reserved child ids (0.2.0-rc.x `subagents.start`), a
  * child's id is known only after its start resolves; `resolve` waits for
- * in-flight starts before deciding that a sub-agent is not an RSI role.
+ * in-flight starts before deciding that a sub-agent is not an RSI role, and
+ * `pendingHidden` lets synchronous guards fail closed in that window.
  */
 export class RoleRegistry {
   readonly #roles = new Map<string, RoleContext>()
-  readonly #starting = new Set<Promise<unknown>>()
+  readonly #ever = new Set<string>()
+  readonly #starting = new Map<Promise<unknown>, readonly string[]>()
 
   get(id: string): RoleContext | undefined {
     return this.#roles.get(id)
@@ -47,19 +72,35 @@ export class RoleRegistry {
 
   set(id: string, role: RoleContext): void {
     this.#roles.set(id, role)
+    this.#ever.add(id)
   }
 
   delete(id: string): void {
     this.#roles.delete(id)
   }
 
+  /** Whether `id` ever named a role context of this process (closed ones included). */
+  isRoleId(id: string): boolean {
+    return this.#ever.has(id)
+  }
+
   get size(): number {
     return this.#roles.size
   }
 
+  /** Whether a start whose child id is still unknown is in flight. */
+  get starting(): boolean {
+    return this.#starting.size > 0
+  }
+
+  /** Hidden roots of every in-flight unreserved start. */
+  get pendingHidden(): string[] {
+    return [...new Set([...this.#starting.values()].flat())]
+  }
+
   /** Tracks one start whose child id is unknown until it settles. */
-  track<T>(start: Promise<T>): Promise<T> {
-    this.#starting.add(start)
+  track<T>(start: Promise<T>, hidden: readonly string[] = []): Promise<T> {
+    this.#starting.set(start, hidden)
     void start.finally(() => this.#starting.delete(start)).catch(() => undefined)
     return start
   }
@@ -69,7 +110,7 @@ export class RoleRegistry {
     const known = this.#roles.get(agent.id)
     if (known || agent.session.header.origin !== 'subagent' || this.#starting.size === 0) return known
     const aborted = new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }))
-    await Promise.race([Promise.allSettled([...this.#starting]), aborted])
+    await Promise.race([Promise.allSettled([...this.#starting.keys()]), aborted])
     signal.throwIfAborted()
     return this.#roles.get(agent.id)
   }

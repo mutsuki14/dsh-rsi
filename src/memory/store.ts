@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto'
-import { appendFile, cp, lstat, mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { appendFile, cp, lstat, mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { hostname } from 'node:os'
 import { dirname, join, relative, sep } from 'node:path'
 import type { LeakageAudit } from './audit.ts'
 import { sha256, treeSha256, type TreeHashes } from './hash.ts'
@@ -155,15 +156,34 @@ function draftDirName(episode: string): string {
 
 const SHA256_HEX = /^[0-9a-f]{64}$/
 
+/** Written before an install and removed after its journal record: recovery finishes or drops it. */
+interface PendingCommit {
+  v: 1
+  record: CommitRecord
+}
+
+export interface MemoryStoreOptions {
+  keepHistory: boolean
+  audit?: LeakageAudit
+  /** Configured test-time reuse: as frozen as the marker file, for every writer. */
+  frozen?: boolean
+  /** How long a mutation waits for another process's store lock. */
+  lockTimeoutMs?: number
+}
+
 /**
  * Durable, Actor-owned experience memory (RSIAgent `~/.memory` plus the host
  * commit pipeline). Layout under `root`:
  *
  * - `memory/` — the canonical tree, read by every new Actor context;
- * - `drafts/<episode>/` — learning-phase working copies;
+ * - `drafts/<episode>/` and `drafts/<episode>.json` — learning-phase working
+ *   copies and their metadata (written last, removed first);
  * - `journal.jsonl` — append-only commit records with before/after digests;
+ * - `commit.pending.json` — an install in flight, finished or dropped on recovery;
+ * - `quarantined/<episode>` — learning phases the silent audit refused;
  * - `history/<n>/` — optional full snapshots after each commit;
- * - `frozen.json` — present when memory is frozen for test-time reuse.
+ * - `frozen.json` — present when memory is frozen for test-time reuse;
+ * - `.lock` — the cross-process mutation lock.
  */
 export class MemoryStore {
   readonly canonicalDir: string
@@ -173,34 +193,153 @@ export class MemoryStore {
   constructor(
     readonly root: string,
     readonly limits: MemoryLimits,
-    readonly options: { keepHistory: boolean, audit?: LeakageAudit },
+    readonly options: MemoryStoreOptions,
   ) {
     this.canonicalDir = join(root, 'memory')
   }
 
-  /** Creates the layout and recovers from an install interrupted between its two renames. */
+  /** Creates the layout and recovers from an interrupted install, commit, or draft operation. */
   async init(): Promise<void> {
     await mkdir(this.root, { recursive: true })
-    const entries = await readdir(this.root)
-    const backups = entries.filter(name => name.startsWith('.backup-'))
-    if (!(await exists(this.canonicalDir)) && backups.length > 0) {
-      await rename(join(this.root, backups.sort().at(-1)!), this.canonicalDir)
+    await this.#serial(() => this.#locked(async () => {
+      const entries = await readdir(this.root)
+      const backups = entries.filter(name => name.startsWith('.backup-'))
+      if (!(await exists(this.canonicalDir)) && backups.length > 0) {
+        await rename(join(this.root, backups.sort().at(-1)!), this.canonicalDir)
+      }
+      for (const name of entries) {
+        if (name.startsWith('.staging-') || (name.startsWith('.backup-') && (await exists(this.canonicalDir)))) {
+          await rm(join(this.root, name), { recursive: true, force: true })
+        }
+      }
+      await mkdir(this.canonicalDir, { recursive: true })
+      await this.#resolvePending()
+      // Drafts whose episode already reached the journal are leftovers of a crash after promotion;
+      // a draft directory without valid metadata was never completely opened, or was half discarded.
+      const committed = new Set((await this.journal()).map(record => record.episode))
+      const draftsDir = join(this.root, 'drafts')
+      const names = await readdir(draftsDir).catch(() => [] as string[])
+      const valid = new Set<string>()
+      for (const name of names) {
+        if (name.endsWith('.json.tmp')) {
+          await rm(join(draftsDir, name), { force: true })
+          continue
+        }
+        if (!name.endsWith('.json')) continue
+        const meta = await this.#readDraftMeta(join(draftsDir, name))
+        if (meta && !committed.has(meta.episode) && (await exists(join(draftsDir, draftDirName(meta.episode))))) {
+          valid.add(draftDirName(meta.episode))
+          continue
+        }
+        await rm(join(draftsDir, name), { force: true })
+        if (meta) await rm(join(draftsDir, draftDirName(meta.episode)), { recursive: true, force: true })
+      }
+      for (const name of names) {
+        if (name.endsWith('.json') || name.endsWith('.json.tmp') || valid.has(name)) continue
+        await rm(join(draftsDir, name), { recursive: true, force: true })
+      }
+    }))
+  }
+
+  /** Finishes an install whose tree reached canonical but whose journal record did not, or drops one that never installed. */
+  async #resolvePending(): Promise<void> {
+    const path = join(this.root, 'commit.pending.json')
+    let pending: PendingCommit | undefined
+    try {
+      pending = JSON.parse(await readFile(path, 'utf8')) as PendingCommit
+    } catch {
+      // No marker, or a torn one written before any rename: nothing was installed.
+      await rm(path, { force: true })
+      return
     }
-    for (const name of entries) {
-      if (name.startsWith('.staging-') || (name.startsWith('.backup-') && (await exists(this.canonicalDir)))) {
-        await rm(join(this.root, name), { recursive: true, force: true })
+    const canonical = manifestHash(manifestOf(await walk(this.canonicalDir)))
+    if (pending.v === 1 && canonical === pending.record.treeAfter) {
+      await this.#journalize(pending.record)
+      await rm(join(this.root, 'drafts', `${draftDirName(pending.record.episode)}.json`), { force: true })
+      await rm(join(this.root, 'drafts', draftDirName(pending.record.episode)), { recursive: true, force: true })
+    }
+    await rm(path, { force: true })
+  }
+
+  /** Appends a record once (newline-safe after a torn tail) and snapshots the tree it produced. */
+  async #journalize(record: CommitRecord): Promise<void> {
+    const journal = await this.journal()
+    if (journal.some(entry => entry.episode === record.episode)) return
+    const path = join(this.root, 'journal.jsonl')
+    let prefix = ''
+    try {
+      const info = await stat(path)
+      if (info.size > 0) {
+        const handle = await open(path, 'r')
+        try {
+          const last = Buffer.alloc(1)
+          await handle.read(last, 0, 1, info.size - 1)
+          if (last[0] !== 0x0a) prefix = '\n'
+        } finally {
+          await handle.close()
+        }
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+    await appendFile(path, `${prefix}${JSON.stringify(record)}\n`)
+    if (this.options.keepHistory) {
+      const snapshot = join(this.root, 'history', String(journal.length + 1).padStart(4, '0'))
+      await rm(snapshot, { recursive: true, force: true })
+      await cp(this.canonicalDir, snapshot, { recursive: true })
+    }
+  }
+
+  /**
+   * Cross-process mutation lock (`O_EXCL` lock file). Two dsh processes in the
+   * same project share one memory root; recovery and installs never interleave.
+   * A lock whose owner process on this host is gone is taken over.
+   */
+  async #locked<T>(task: () => Promise<T>): Promise<T> {
+    const path = join(this.root, '.lock')
+    const deadline = Date.now() + (this.options.lockTimeoutMs ?? 60_000)
+    const owner = `${JSON.stringify({ pid: process.pid, host: hostname(), at: new Date().toISOString() })}\n`
+    for (;;) {
+      try {
+        const handle = await open(path, 'wx')
+        try {
+          await handle.writeFile(owner, 'utf8')
+        } finally {
+          await handle.close()
+        }
+        break
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+        if (await this.#staleLock(path)) {
+          await rm(path, { force: true })
+          continue
+        }
+        if (Date.now() > deadline) throw new Error(`memory store ${this.root} is locked by another process`)
+        await new Promise(resolve => setTimeout(resolve, 50))
       }
     }
-    await mkdir(this.canonicalDir, { recursive: true })
-    // Drafts whose episode already reached the journal are leftovers of a crash after promotion.
-    const committed = new Set((await this.journal()).map(record => record.episode))
-    for (const name of await readdir(join(this.root, 'drafts')).catch(() => [] as string[])) {
-      if (!name.endsWith('.json')) continue
-      const meta = await this.#readDraftMeta(join(this.root, 'drafts', name))
-      if (meta && committed.has(meta.episode)) {
-        await rm(join(this.root, 'drafts', draftDirName(meta.episode)), { recursive: true, force: true })
-        await rm(join(this.root, 'drafts', name), { force: true })
+    try {
+      return await task()
+    } finally {
+      await rm(path, { force: true })
+    }
+  }
+
+  async #staleLock(path: string): Promise<boolean> {
+    try {
+      const owner = JSON.parse(await readFile(path, 'utf8')) as { pid?: number, host?: string }
+      if (owner.host !== hostname() || typeof owner.pid !== 'number') return false
+      if (owner.pid === process.pid) return false
+      try {
+        process.kill(owner.pid, 0)
+        return false
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === 'ESRCH'
       }
+    } catch {
+      // A lock file still being written, or torn by a crash: torn locks older than a few seconds are stale.
+      const info = await stat(path).catch(() => undefined)
+      return info !== undefined && Date.now() - info.mtimeMs > 5_000
     }
   }
 
@@ -265,8 +404,14 @@ export class MemoryStore {
     return matches
   }
 
+  /** Whether the freeze marker is present. */
   async isFrozen(): Promise<boolean> {
     return exists(join(this.root, 'frozen.json'))
+  }
+
+  /** Whether memory may not change: frozen by configuration or by the marker. */
+  async frozen(): Promise<boolean> {
+    return this.options.frozen === true || (await this.isFrozen())
   }
 
   /** Freezes the current tree: drafts can no longer be opened or committed. */
@@ -293,27 +438,31 @@ export class MemoryStore {
 
   /**
    * Copies the current canonical tree into a fresh draft for one episode's
-   * learning phase. Its metadata is written after the copy completes, so a
-   * restarted process can reopen exactly that draft.
+   * learning phase. Its metadata is written after the copy completes (and is
+   * removed before a stale copy is replaced), so a restarted process reopens
+   * exactly a complete draft. `fresh` discards any earlier draft of the episode
+   * instead of continuing it (engine episodes never resume a dead context's draft).
    */
-  openDraft(episode: string): Promise<MemoryDraft> {
-    return this.#serial(async () => {
-      if (await this.isFrozen()) throw new MemoryFrozenError()
+  openDraft(episode: string, options: { fresh?: boolean } = {}): Promise<MemoryDraft> {
+    return this.#serial(() => this.#locked(async () => {
+      if (await this.frozen()) throw new MemoryFrozenError()
+      if (options.fresh) await this.#discard(episode)
       const existing = this.#drafts.get(episode) ?? (await this.#reopen(episode))
       if (existing) return existing
       const dir = join(this.root, 'drafts', draftDirName(episode))
+      const metaPath = `${dir}.json`
+      await rm(metaPath, { force: true })
       await rm(dir, { recursive: true, force: true })
       await mkdir(dirname(dir), { recursive: true })
       await cp(this.canonicalDir, dir, { recursive: true })
       const baseManifest = manifestOf(await walk(dir))
       const draft = new MemoryDraft(episode, dir, manifestHash(baseManifest), baseManifest)
       const meta: DraftMeta = { v: 1, episode, baseHash: draft.baseHash, baseManifest, createdAt: new Date().toISOString() }
-      const metaPath = `${dir}.json`
       await writeFile(`${metaPath}.tmp`, `${JSON.stringify(meta)}\n`)
       await rename(`${metaPath}.tmp`, metaPath)
       this.#drafts.set(episode, draft)
       return draft
-    })
+    }))
   }
 
   /** Reopens a draft from disk after a restart; `undefined` when it is gone or incomplete. */
@@ -330,10 +479,30 @@ export class MemoryStore {
     return draft
   }
 
+  /** Files and bytes a draft tree holds, from metadata only. */
+  async #usage(dir: string): Promise<Map<string, number>> {
+    const sizes = new Map<string, number>()
+    const visit = async (current: string): Promise<void> => {
+      for (const entry of await readdir(current, { withFileTypes: true }).catch(() => [])) {
+        const full = join(current, entry.name)
+        if (entry.isDirectory()) await visit(full)
+        else if (entry.isFile()) sizes.set(relative(dir, full).split(sep).join('/'), (await lstat(full)).size)
+      }
+    }
+    await visit(dir)
+    return sizes
+  }
+
   async writeDraft(draft: MemoryDraft, path: string, content: string): Promise<void> {
     const rel = safeRelativePath(path)
     const bytes = Buffer.byteLength(content, 'utf8')
     if (bytes > this.limits.maxFileBytes) throw new MemoryLimitError(`memory file ${rel} is ${bytes} bytes; the limit is ${this.limits.maxFileBytes}`)
+    // Aggregate limits apply while the Actor writes, so it can trim within its own learning turn.
+    const usage = await this.#usage(draft.dir)
+    const files = usage.size + (usage.has(rel) ? 0 : 1)
+    const total = [...usage.values()].reduce((sum, size) => sum + size, 0) - (usage.get(rel) ?? 0) + bytes
+    if (files > this.limits.maxFiles) throw new MemoryLimitError(`memory would hold ${files} files; the limit is ${this.limits.maxFiles}. Merge or delete files first.`)
+    if (total > this.limits.maxTotalBytes) throw new MemoryLimitError(`memory would hold ${total} bytes; the limit is ${this.limits.maxTotalBytes}. Condense or delete files first.`)
     const full = join(draft.dir, rel)
     await mkdir(dirname(full), { recursive: true })
     await writeFile(full, content, 'utf8')
@@ -379,25 +548,43 @@ export class MemoryStore {
     return manifestOf(await walk(draft.dir))
   }
 
-  async discardDraft(episode: string): Promise<void> {
+  /** Whether the silent audit refused this episode's learning phase. */
+  async isQuarantined(episode: string): Promise<boolean> {
+    return exists(join(this.root, 'quarantined', draftDirName(episode)))
+  }
+
+  discardDraft(episode: string): Promise<void> {
+    return this.#serial(() => this.#locked(() => this.#discard(episode)))
+  }
+
+  /** Metadata first: a crash mid-delete leaves a directory init() removes, never a reopenable partial draft. */
+  async #discard(episode: string): Promise<void> {
     this.#drafts.delete(episode)
     const dir = join(this.root, 'drafts', draftDirName(episode))
-    await rm(dir, { recursive: true, force: true })
     await rm(`${dir}.json`, { force: true })
+    await rm(`${dir}.json.tmp`, { force: true })
+    await rm(dir, { recursive: true, force: true })
   }
 
   /**
    * Promotes a draft as the new canonical tree: validates limits and the
-   * optional audit, replaces the full tree with stage-and-rename, then appends
-   * the journal. Commits are serialized; a draft whose base is no longer
-   * canonical is refused rather than silently overwriting a sibling commit.
+   * optional audit, records the intended commit, replaces the full tree with
+   * stage-and-rename, then appends the journal. Commits are serialized across
+   * processes; a draft whose base is no longer canonical is refused rather than
+   * silently overwriting a sibling commit.
    */
   commit(draft: MemoryDraft, meta: { kind: EpisodeKind, outcome: TerminalOutcome }): Promise<CommitRecord> {
-    return this.#serial(() => this.#commit(draft, meta))
+    return this.#serial(() => this.#locked(() => this.#commit(draft, meta)))
   }
 
   async #commit(draft: MemoryDraft, meta: { kind: EpisodeKind, outcome: TerminalOutcome }): Promise<CommitRecord> {
-    if (await this.isFrozen()) throw new MemoryFrozenError()
+    if (await this.frozen()) throw new MemoryFrozenError()
+    await this.#resolvePending()
+    const already = await this.findCommit(draft.episode)
+    if (already) {
+      await this.#discard(draft.episode)
+      return already
+    }
     const before = await this.manifest()
     const beforeHash = manifestHash(before)
     if (beforeHash !== draft.baseHash) throw new MemoryConflictError(draft.baseHash, beforeHash)
@@ -412,20 +599,14 @@ export class MemoryStore {
     if (this.options.audit?.enabled) {
       const text = new Map([...files].map(([path, data]) => [path, data.toString('utf8')] as const))
       if (this.options.audit.flagged(text).length > 0) {
-        await this.discardDraft(draft.episode)
+        // Durable before the draft goes: no second learning phase for a quarantined episode, even after a crash.
+        await mkdir(join(this.root, 'quarantined'), { recursive: true })
+        await writeFile(join(this.root, 'quarantined', draftDirName(draft.episode)), `${new Date().toISOString()}\n`)
+        await this.#discard(draft.episode)
         throw new MemoryQuarantineError()
       }
     }
 
-    const nonce = randomBytes(6).toString('hex')
-    const staging = join(this.root, `.staging-${nonce}`)
-    const backup = join(this.root, `.backup-${nonce}`)
-    await cp(draft.dir, staging, { recursive: true })
-    await rename(this.canonicalDir, backup)
-    await rename(staging, this.canonicalDir)
-    await rm(backup, { recursive: true, force: true })
-
-    const delta = diffManifests(before, after)
     const record: CommitRecord = {
       episode: draft.episode,
       kind: meta.kind,
@@ -435,16 +616,29 @@ export class MemoryStore {
       bytes: total,
       treeBefore: beforeHash,
       treeAfter: manifestHash(after),
-      ...delta,
+      ...diffManifests(before, after),
     }
-    await appendFile(join(this.root, 'journal.jsonl'), `${JSON.stringify(record)}\n`)
-    if (this.options.keepHistory) {
-      const count = (await this.journal()).length
-      await cp(this.canonicalDir, join(this.root, 'history', String(count).padStart(4, '0')), { recursive: true })
+    const nonce = randomBytes(6).toString('hex')
+    const staging = join(this.root, `.staging-${nonce}`)
+    const backup = join(this.root, `.backup-${nonce}`)
+    const pendingPath = join(this.root, 'commit.pending.json')
+    await cp(draft.dir, staging, { recursive: true })
+    const pending: PendingCommit = { v: 1, record }
+    await writeFile(`${pendingPath}.tmp`, `${JSON.stringify(pending)}\n`)
+    await rename(`${pendingPath}.tmp`, pendingPath)
+    await rename(this.canonicalDir, backup)
+    try {
+      await rename(staging, this.canonicalDir)
+    } catch (error) {
+      await rename(backup, this.canonicalDir)
+      await rm(staging, { recursive: true, force: true })
+      await rm(pendingPath, { force: true })
+      throw error
     }
-    this.#drafts.delete(draft.episode)
-    await rm(draft.dir, { recursive: true, force: true })
-    await rm(`${draft.dir}.json`, { force: true })
+    await this.#journalize(record)
+    await rm(pendingPath, { force: true })
+    await rm(backup, { recursive: true, force: true })
+    await this.#discard(draft.episode)
     return record
   }
 

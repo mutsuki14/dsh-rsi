@@ -7,6 +7,7 @@ import type { SubagentResult, SubagentRuntime } from '@deepseek-ai/dsh-subagent'
 import type { ToolRestriction } from '@deepseek-ai/dsh-tools'
 import {
   InfraError,
+  TransportInfraError,
   type EngineObserver,
   type OpenRoleOptions,
   type RoleConversation,
@@ -16,7 +17,7 @@ import {
 } from '../engine/types.ts'
 import type { MemoryStore } from '../memory/store.ts'
 import { HandoffChannel } from './channel.ts'
-import type { RoleContext, RoleRegistry } from './registry.ts'
+import { freshCounters, type RoleContext, type RoleRegistry } from './registry.ts'
 
 export interface SubagentRoleRuntimeOptions {
   subagents: SubagentRuntime
@@ -25,7 +26,8 @@ export interface SubagentRoleRuntimeOptions {
   provider: string
   registry: RoleRegistry
   store: MemoryStore
-  toolFilter: (role: OpenRoleOptions['role']) => ToolRestriction
+  /** The role's tool mask, resolved in the parent's scope (agent-preset tools included). */
+  toolFilter: (role: OpenRoleOptions['role'], parent: Agent) => ToolRestriction
   agentOptions: (route: RoleRoute) => AgentOptions | undefined
   /** Actor-private paths a role's file tools must not touch. */
   hidden: (role: OpenRoleOptions['role']) => string[]
@@ -93,6 +95,7 @@ export class SubagentConversation implements RoleConversation {
   #scope: RoleContext | undefined
   #settled: Promise<void> | undefined
   #closed = false
+  #disposed = false
 
   constructor(readonly runtime: SubagentRoleRuntimeOptions, readonly role: OpenRoleOptions) {}
 
@@ -100,18 +103,55 @@ export class SubagentConversation implements RoleConversation {
     return this.#child?.childId
   }
 
-  async send(message: string): Promise<RoleReply> {
+  /** Whether the context can no longer take a message (closed, ended, or failed). */
+  get ended(): boolean {
+    return this.#closed || this.#channel.closed || this.#channel.ended
+  }
+
+  async send(message: string, signal?: AbortSignal): Promise<RoleReply> {
     if (this.#closed) throw new InfraError(`${this.role.label}: the role context is closed`)
+    signal?.throwIfAborted()
     if (this.#child === undefined) await this.#start(message)
     else if (!this.#channel.respond(message)) {
       // RSIAgent never continues in a lossy copy: a context that ended is infrastructure.
       throw new InfraError(`${this.role.label}: the role context ended its turn and cannot receive further messages`)
     }
-    const event = await this.#channel.next()
-    return event.kind === 'handoff' ? { text: event.text, actions: event.actions } : { text: event.output, actions: event.actions }
+    const event = await this.#next(signal)
+    switch (event.kind) {
+      case 'handoff':
+        return { text: event.text, actions: event.actions }
+      case 'stalled':
+        // Transport exhaustion ends the phase, not the context: it is held for the engine's next message.
+        throw new TransportInfraError(`${this.role.label}: ${event.reason}`)
+      case 'ended':
+        throw new InfraError(`${this.role.label}: the role context ended its turn without a handoff`)
+      default: {
+        const unreachable: never = event
+        throw new Error(`unknown channel event ${String(unreachable)}`)
+      }
+    }
   }
 
-  /** Ends the context: a parked handoff concludes the child's turn without another model call. */
+  /** The next channel event; a cancelled wait aborts the child instead of leaving it running unowned. */
+  async #next(signal: AbortSignal | undefined) {
+    if (!signal) return this.#channel.next()
+    let onAbort: (() => void) | undefined
+    const aborted = new Promise<never>((_resolve, reject) => {
+      onAbort = () => reject(signal.reason instanceof Error ? signal.reason : new Error('the role context was cancelled'))
+      if (signal.aborted) onAbort()
+      else signal.addEventListener('abort', onAbort, { once: true })
+    })
+    try {
+      return await Promise.race([this.#channel.next(), aborted])
+    } catch (error) {
+      if (signal.aborted) await this.abort()
+      throw error
+    } finally {
+      if (onAbort) signal.removeEventListener('abort', onAbort)
+    }
+  }
+
+  /** Ends the context: a parked handoff or held stall concludes the child's turn without another model call. */
   async close(): Promise<void> {
     if (this.#closed) return
     this.#closed = true
@@ -135,15 +175,18 @@ export class SubagentConversation implements RoleConversation {
     }
   }
 
-  /** Hard stop for cancellation: the child is disposed wherever it is. */
+  /** Hard stop for cancellation: the child is disposed wherever it is, and waiters fail. */
   async abort(): Promise<void> {
     this.#closed = true
     if (this.#scope) this.#scope.closing = true
     this.#channel.close()
+    this.#channel.fail(new InfraError(`${this.role.label}: the role context was cancelled`))
     if (this.#child) await this.#dispose(this.#child)
   }
 
   async #dispose(child: ManagedChild): Promise<void> {
+    if (this.#disposed) return
+    this.#disposed = true
     this.runtime.registry.delete(child.childId)
     await child.dispose().catch((error: unknown) => {
       this.runtime.observe({ type: 'ROLE_CONTEXT_DISPOSE_FAILED', label: this.role.label, error: String(error) })
@@ -163,16 +206,13 @@ export class SubagentConversation implements RoleConversation {
       hidden: this.runtime.hidden(this.role.role),
       readOnly: this.role.role === 'verifier' && this.runtime.readOnlyVerifier,
       closing: false,
-      sinceHandoff: 0,
-      sinceStop: 0,
-      actionlessStops: 0,
-      stops: 0,
+      ...freshCounters(),
     }
     this.#scope = scope
     const task = {
       parent: this.runtime.parent,
       persona: this.role.system,
-      toolFilter: this.runtime.toolFilter(this.role.role),
+      toolFilter: this.runtime.toolFilter(this.role.role, this.runtime.parent),
       ...(agentOptions === undefined ? {} : { agentOptions }),
     }
     const api = this.runtime.subagents as unknown as Partial<ActivationApi & OneShotApi>
@@ -194,12 +234,13 @@ export class SubagentConversation implements RoleConversation {
         if (scope.readOnly) throw new Error('this dsh version cannot reserve a child id, so the Verifier cannot be sandboxed at creation')
         // No initial-directory option on this host: the child starts in the parent's directory.
         const located = `WORKING DIRECTORY: ${this.role.cwd}\nYour tools start in a different directory. Run every command inside that directory (cd into it first) or use absolute paths.\n\n${prompt}`
+        // Guards consult the pending hidden roots until the id is known, so the first tool call cannot slip through.
         const run = await this.runtime.registry.track(api.start(this.runtime.provider, {
           ...task,
           label: this.role.label,
           signal: this.runtime.signal,
           prompt: [{ type: 'text', text: located }],
-        }))
+        }), scope.hidden)
         childId = run.id
         this.runtime.registry.set(childId, scope)
         this.#child = { childId, result: run.result, dispose: () => run.dispose() }
@@ -211,8 +252,13 @@ export class SubagentConversation implements RoleConversation {
       this.#closed = true
       throw new InfraError(`${this.role.label}: sub-agent start failed: ${String(error)}`)
     }
-    this.runtime.observe({ type: 'ROLE_CONTEXT_STARTED', label: this.role.label, role: this.role.role, childId })
     const child = this.#child
+    if (this.#closed) {
+      // Cancelled while the start was in flight: never leave the child running unowned.
+      await this.#dispose(child)
+      throw new InfraError(`${this.role.label}: the role context was cancelled while starting`)
+    }
+    this.runtime.observe({ type: 'ROLE_CONTEXT_STARTED', label: this.role.label, role: this.role.role, childId })
     const channel = this.#channel
     const onAbort = () => {
       void this.abort()

@@ -6,6 +6,11 @@
  * next message, which becomes the tool result. The child therefore keeps its
  * complete trajectory across work, verification, and learning phases — the
  * same-context continuity RSIAgent requires — without new loop machinery.
+ *
+ * When a phase stalls (consecutive segments without any action or handoff),
+ * the host holds the child at its turn boundary instead of letting the turn
+ * end: the engine sees transport exhaustion, as in RSIAgent, yet the context
+ * stays alive for the harness's next message (forced inspection, learning).
  */
 
 /** Resolves a parked handoff when the engine has no further message: the role ends its turn. */
@@ -13,6 +18,9 @@ export const CLOSED: unique symbol = Symbol('dsh-rsi.closed')
 
 export type ChannelEvent =
   | { kind: 'handoff', text: string, actions: number }
+  /** The phase stalled; the context is held and still accepts the next message. */
+  | { kind: 'stalled', output: string, actions: number, reason: string }
+  /** The child's turn settled without being held: the context cannot continue. */
   | { kind: 'ended', output: string, actions: number }
 
 interface Pending {
@@ -36,18 +44,29 @@ export class HandoffChannel {
     return this.#closed
   }
 
+  /** Whether the child waits for the engine's next message (a parked handoff or a held stall). */
   get hasPendingHandoff(): boolean {
     return this.#pending !== undefined
   }
 
   /** Child side: publishes `text` and waits for the engine's next message, or CLOSED. */
   handoff(text: string, actions: number, signal: AbortSignal): Promise<string | typeof CLOSED> {
-    if (this.#closed) return Promise.resolve(CLOSED)
+    return this.#park({ kind: 'handoff', text, actions }, signal, 'rsi_handoff was cancelled')
+  }
+
+  /** Host side: holds a stalled child at its turn boundary until the engine's next message, or CLOSED. */
+  hold(output: string, actions: number, reason: string, signal: AbortSignal): Promise<string | typeof CLOSED> {
+    return this.#park({ kind: 'stalled', output, actions, reason }, signal, 'the held role turn was cancelled')
+  }
+
+  #park(event: ChannelEvent, signal: AbortSignal, cancelled: string): Promise<string | typeof CLOSED> {
+    if (this.#closed || this.#ended) return Promise.resolve(CLOSED)
     if (this.#pending) return Promise.reject(new Error('a handoff is already pending; wait for its reply'))
+    if (signal.aborted) return Promise.reject(new Error(cancelled))
     return new Promise<string | typeof CLOSED>((resolve, reject) => {
       const onAbort = () => {
         if (this.#pending === pending) this.#pending = undefined
-        reject(new Error('rsi_handoff was cancelled'))
+        reject(new Error(cancelled))
       }
       const pending: Pending = {
         respond: message => {
@@ -61,11 +80,11 @@ export class HandoffChannel {
       }
       this.#pending = pending
       signal.addEventListener('abort', onAbort, { once: true })
-      this.#emit({ kind: 'handoff', text, actions })
+      this.#emit(event)
     })
   }
 
-  /** Engine side: resolves the pending handoff with the next message. */
+  /** Engine side: resolves the pending handoff or held stall with the next message. */
   respond(message: string): boolean {
     const pending = this.#pending
     if (!pending) return false
@@ -82,7 +101,7 @@ export class HandoffChannel {
     pending?.respond(CLOSED)
   }
 
-  /** Engine side: waits for the next handoff or the end of the child's turn. */
+  /** Engine side: waits for the next handoff, stall, or the end of the child's turn. */
   next(): Promise<ChannelEvent> {
     const queued = this.#queued.shift()
     if (queued) return Promise.resolve(queued)
@@ -101,7 +120,7 @@ export class HandoffChannel {
     this.#emit({ kind: 'ended', output, actions })
   }
 
-  /** The child failed below the protocol (infrastructure). */
+  /** The child failed below the protocol (infrastructure), or the engine gave up on it. */
   fail(error: Error): void {
     if (this.#ended) return
     this.#ended = true

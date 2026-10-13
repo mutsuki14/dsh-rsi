@@ -16,6 +16,7 @@ export interface VerifierConfig {
   isolation: 'auto' | 'sandbox' | 'rollback'
   allowUnverified: boolean
   taskMessages: number
+  allowTools: string[]
   denyTools: string[]
   checkpointMaxBytes: number
   checkpointMaxFiles: number
@@ -83,8 +84,8 @@ function route(label: string): Schema<RoleRoute> {
 export const Config: Schema<Config> = Schema.object({
   mode: Schema.union(['learn', 'frozen']).default('learn')
     .description('`learn` runs verify → distill → reconcile → commit after tasks; `frozen` is test-time reuse: memory is read-only.'),
-  stateDir: Schema.string().default('.dsh-rsi')
-    .description('Workspace directory for lineage project roots. Relative paths resolve against the session project directory.'),
+  stateDir: Schema.string().default('')
+    .description('Where lineage project roots (what role agents work in) live. Empty: $DSH_HOME/rsi-work/<project>-<hash>, outside the user\'s workspace and its git repository. Relative paths resolve against the session project directory.'),
   memoryDir: Schema.string().default('')
     .description('Durable memory, drafts, journal, reports, and lineage records. Empty: $DSH_HOME/rsi/<project>-<hash>, outside the workspace, like RSIAgent host-side memory.'),
   promptInventory: Schema.natural().default(40)
@@ -117,8 +118,11 @@ export const Config: Schema<Config> = Schema.object({
       .description('Let the Verifier publish UNVERIFIED to request reproducible evidence instead of guessing.'),
     taskMessages: Schema.natural().min(1).max(16).default(3)
       .description('Most recent user messages given verbatim to the interactive Verifier as the authoritative task.'),
+    allowTools: Schema.array(Schema.string()).default([
+      'read', 'read_image', 'grep', 'glob', 'bash', 'pwsh', 'job_output', 'job_list', 'job_kill', 'run_code', 'lsp', 'skill', 'todo_write', 'working_directory',
+    ]).description('The only tools a Verifier context may call (besides rsi_handoff): inspection and confined execution. MCP and other tools that act outside the sandbox stay out unless listed here.'),
     denyTools: Schema.array(Schema.string()).default(['write', 'edit', 'web_fetch', 'web_search'])
-      .description('Tools hidden from Verifier contexts in addition to every RSI and delegation tool (unknown names are ignored).'),
+      .description('Tools hidden from Verifier contexts even when allowed, in addition to every RSI and delegation tool (unknown names are ignored).'),
     checkpointMaxBytes: Schema.natural().default(256 * 1024 * 1024)
       .description('Interactive candidate checkpoint size above which changes are only detected, not restored.'),
     checkpointMaxFiles: Schema.natural().default(20_000),

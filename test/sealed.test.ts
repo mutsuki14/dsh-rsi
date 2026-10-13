@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { treeFingerprint } from '../src/engine/workspace.ts'
 import { runSealedEvaluation } from '../src/host/sealed.ts'
 import { MemoryStore } from '../src/memory/store.ts'
 
@@ -45,4 +46,27 @@ console.log(JSON.stringify({ score: answer === '42' ? 1 : 0 }))`)
     expect(record.score).toBeUndefined()
     expect(record.attempts).toHaveLength(2)
   })
+
+  it('measures the candidate exactly as the lineage ended and refuses one edited afterwards', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'dsh-rsi-sealed-'))
+    const store = new MemoryStore(join(base, 'mem'), { maxFileBytes: 1024, maxTotalBytes: 4096, maxFiles: 8 }, { keepHistory: false })
+    await store.init()
+    const lineageDir = join(store.root, 'lineages', 'd3')
+    const copy = join(lineageDir, 'final-candidate')
+    await mkdir(copy, { recursive: true })
+    await writeFile(join(copy, 'answer.txt'), '42')
+    await writeFile(join(lineageDir, 'lineage.json'), '{}')
+    // The work root was polished after the lineage ended; the private copy is what counts.
+    const workRoot = join(base, 'work', 'project')
+    await mkdir(workRoot, { recursive: true })
+    await writeFile(join(workRoot, 'answer.txt'), 'edited later')
+    await writeFile(join(lineageDir, 'result.json'), JSON.stringify({ candidateRoot: workRoot, candidateCopy: copy, candidateDigest: await treeFingerprint(copy) }))
+    const evaluator = [process.execPath, '-e', 'const a=require("fs").readFileSync(process.env.RSI_CANDIDATE_ROOT+"/answer.txt","utf8");console.log(JSON.stringify({score:a==="42"?1:0}))']
+    const record = await runSealedEvaluation({ lineage: 'd3', lineageDir, resultsDir: join(store.root, 'sealed'), runId: 'r1', store, config: { command: evaluator, timeoutSec: 30, retries: 0 } })
+    expect(record).toMatchObject({ status: 'scored', score: 1 })
+    await writeFile(join(copy, 'answer.txt'), 'tampered')
+    await expect(runSealedEvaluation({ lineage: 'd3', lineageDir, resultsDir: join(store.root, 'sealed'), runId: 'r2', store, config: { command: evaluator, timeoutSec: 30, retries: 0 } }))
+      .rejects.toThrow(/changed after the lineage ended/)
+  })
+
 })

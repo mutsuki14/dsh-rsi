@@ -38,7 +38,7 @@ describe('task projection', () => {
       call('c2', 'rsi_submit'), result('c2', submit(2, 'PASS')),
     ])
     expect(state).toMatchObject({ generation: 2, verdict: 'PASS', reports: [{ generation: 1, verdict: 'FAIL' }, { generation: 2, verdict: 'PASS' }] })
-    const learning = { episode: 'task-s-3', owner: 's', stage: 'distill' as const, outcome: 'PASS' as const, verdictSeq: state.verdictSeq! }
+    const learning = { episode: 'task-s-3', owner: 's', stage: 'distill' as const, outcome: 'PASS' as const, verdictSeq: state.verdictSeq!, stageStep: null }
     const learned = fold([
       call('c3', 'rsi_learn'), result('c3', { rsi: 1, op: 'learn', learning }),
       call('c4', 'rsi_memory_commit'), result('c4', { rsi: 1, op: 'reconcile', episode: 'task-s-3' }),
